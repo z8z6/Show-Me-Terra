@@ -2,10 +2,15 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DeckGL,
   GeoJsonLayer,
+  OrbitView,
   OrthographicView,
+  ScatterplotLayer,
+  SimpleMeshLayer,
+  TerrainLayer,
   TextLayer,
   TileLayer,
 } from "deck.gl";
+import { _TerrainExtension as TerrainExtension } from "@deck.gl/extensions";
 
 const COLORS = [
   [225, 171, 82],
@@ -19,9 +24,37 @@ const COLORS = [
   [180, 162, 91],
   [151, 105, 93],
 ];
+const TERRAIN_PALETTE = [
+  [26, 152, 80],
+  [145, 207, 96],
+  [255, 255, 191],
+  [252, 141, 89],
+  [215, 48, 39],
+];
+const TERRAIN_GRADIENT = `linear-gradient(90deg, ${TERRAIN_PALETTE.map(
+  (color, index) =>
+    `rgb(${color.join(" ")}) ${(index / (TERRAIN_PALETTE.length - 1)) * 100}%`,
+).join(", ")})`;
 const HOME = { target: [0, 0, 0], zoom: -6.35, minZoom: -8, maxZoom: 2 };
+const TERRAIN_HOME = {
+  target: [0, 0, 3000],
+  zoom: -6.35,
+  rotationX: 55,
+  rotationOrbit: 25,
+  minZoom: -8,
+  maxZoom: 2,
+};
 const CITY_LABEL_ZOOM = -5;
-const REGION_LABEL_ZOOM = -3;
+const REGION_LABEL_ZOOM = -3.5;
+const PLOT_ZOOM = -2.5;
+const BUILDING_ZOOM = -2;
+const TERRAIN_BASE_HEIGHT = 600;
+const TERRAIN_TARGET_RELIEF = 9000;
+const TERRAIN_MIN_SCALE = 8;
+const TERRAIN_MAX_SCALE = 64;
+const TERRAIN_BOUNDARY_LIFT = 36;
+const TERRAIN_BOUNDARY_STEP = 512;
+const TERRAIN_LABEL_LIFT = 1200;
 const DEVICE_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 1.5);
 const FONT = {
   fontFamily: '"Noto Sans SC", "Microsoft YaHei", sans-serif',
@@ -31,6 +64,7 @@ const FONT = {
   characterSet: "auto",
 };
 const ORTHO_VIEW = new OrthographicView({ id: "ortho", flipY: false });
+const ORBIT_VIEW = new OrbitView({ id: "terrain", orbitAxis: "Z" });
 const CONTROLLER = {
   dragPan: true,
   dragRotate: false,
@@ -44,13 +78,24 @@ const GET_CURSOR = ({ isDragging, isHovering }) =>
 const xy = ({ x, z }) => [x, -z];
 const ring = (points) => [...points.map(xy), xy(points[0])];
 const number = (value) => Math.round(value).toLocaleString("zh-CN");
+const buildingColor = (id) => {
+  let hash = 0;
+  for (let index = 0; index < id.length; index++)
+    hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
+  return COLORS[hash % COLORS.length];
+};
 const getLabelMode = (zoom) =>
-  zoom >= REGION_LABEL_ZOOM
-    ? "region"
+  zoom >= BUILDING_ZOOM
+    ? "building"
+    : zoom >= PLOT_ZOOM
+      ? "plot"
+      : zoom >= REGION_LABEL_ZOOM
+        ? "region"
     : zoom >= CITY_LABEL_ZOOM
       ? "city"
       : "nation";
 const POLYGON_CENTER_CACHE = new WeakMap();
+const MAP_DATA_CACHE = new WeakMap();
 function polygonCenter(points) {
   if (!points?.length) return { x: 0, z: 0 };
   const cached = POLYGON_CENTER_CACHE.get(points);
@@ -80,20 +125,171 @@ function polygonCenter(points) {
   return center;
 }
 
+function createTerrainBoundaries(layout) {
+  const features = [
+    {
+      type: "Feature",
+      properties: { kind: "terra" },
+      geometry: { type: "LineString", coordinates: terrainRing(layout.boundary) },
+    },
+  ];
+  layout.nations.filter((nation) => !nation.underground).forEach((nation) => {
+    const addBoundary = (boundary, kind) => {
+      if (!boundary?.length) return;
+      features.push({
+        type: "Feature",
+        properties: { kind },
+        geometry: { type: "LineString", coordinates: terrainRing(boundary) },
+      });
+    };
+
+    addBoundary(nation.boundary, "nation");
+    nation.cities.forEach((city) => {
+      addBoundary(city.boundary, "city");
+      city.regions.forEach((region) => {
+        addBoundary(region.boundary, "region");
+      });
+    });
+  });
+  return { type: "FeatureCollection", features };
+}
+
+function terrainRing(points) {
+  const positions = [];
+  for (let index = 0; index < points.length; index++) {
+    const start = points[index];
+    const end = points[(index + 1) % points.length];
+    const distance = Math.hypot(end.x - start.x, end.z - start.z);
+    const steps = Math.max(1, Math.ceil(distance / TERRAIN_BOUNDARY_STEP));
+    for (let step = 0; step < steps; step++) {
+      const ratio = step / steps;
+      positions.push([
+        start.x + (end.x - start.x) * ratio,
+        -(start.z + (end.z - start.z) * ratio),
+        TERRAIN_BOUNDARY_LIFT,
+      ]);
+    }
+  }
+  positions.push([...positions[0]]);
+  return positions;
+}
+
+function getTerrainBounds(boundary) {
+  const positions = boundary.map(xy);
+  const xs = positions.map((position) => position[0]);
+  const ys = positions.map((position) => position[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+function sampleTerrainHeight(heightmap, worldX, worldZ) {
+  const sourceSize =
+    heightmap.map_size ??
+    heightmap.spacing * Math.max(heightmap.width, heightmap.depth);
+  const u = Math.max(0, Math.min(1, (worldX - heightmap.origin_x) / sourceSize));
+  const v = Math.max(0, Math.min(1, (worldZ - heightmap.origin_z) / sourceSize));
+  const x = u * (heightmap.width - 1);
+  const z = v * (heightmap.depth - 1);
+  const x0 = Math.floor(x);
+  const z0 = Math.floor(z);
+  const x1 = Math.min(x0 + 1, heightmap.width - 1);
+  const z1 = Math.min(z0 + 1, heightmap.depth - 1);
+  const tx = x - x0;
+  const tz = z - z0;
+  const top =
+    heightmap.heights[z0][x0] * (1 - tx) +
+    heightmap.heights[z0][x1] * tx;
+  const bottom =
+    heightmap.heights[z1][x0] * (1 - tx) +
+    heightmap.heights[z1][x1] * tx;
+  return top * (1 - tz) + bottom * tz;
+}
+
+function calculateTerrainMetrics(boundary, heightmap) {
+  const bounds = boundary.reduce(
+    (result, point) => ({
+      minX: Math.min(result.minX, point.x),
+      minZ: Math.min(result.minZ, point.z),
+      maxX: Math.max(result.maxX, point.x),
+      maxZ: Math.max(result.maxZ, point.z),
+    }),
+    { minX: Infinity, minZ: Infinity, maxX: -Infinity, maxZ: -Infinity },
+  );
+  let min = Infinity;
+  let max = -Infinity;
+  const sampleCount = 256;
+  for (let row = 0; row < sampleCount; row++) {
+    const z = bounds.minZ +
+      (row / (sampleCount - 1)) * (bounds.maxZ - bounds.minZ);
+    for (let column = 0; column < sampleCount; column++) {
+      const x = bounds.minX +
+        (column / (sampleCount - 1)) * (bounds.maxX - bounds.minX);
+      const height = sampleTerrainHeight(heightmap, x, z);
+      min = Math.min(min, height);
+      max = Math.max(max, height);
+    }
+  }
+  const range = Math.max(1, max - min);
+  const scale = Math.max(
+    TERRAIN_MIN_SCALE,
+    Math.min(TERRAIN_MAX_SCALE, TERRAIN_TARGET_RELIEF / range),
+  );
+  return { min, max, range, scale };
+}
+
+function createTerrainBaseMesh(boundary, heightmap, metrics) {
+  const top = boundary.map((point) => [
+    point.x,
+    -point.z,
+    TERRAIN_BASE_HEIGHT +
+      (sampleTerrainHeight(heightmap, point.x, point.z) - metrics.min) *
+        metrics.scale,
+  ]);
+  const positions = [
+    ...top.flat(),
+    ...top.flatMap(([x, y]) => [x, y, 0]),
+  ];
+  const indices = [];
+  const count = top.length;
+
+  for (let index = 0; index < count; index++) {
+    const next = (index + 1) % count;
+    indices.push(index, next, count + next, index, count + next, count + index);
+  }
+  for (let index = 1; index < count - 1; index++) {
+    indices.push(count, count + index + 1, count + index);
+  }
+
+  return {
+    attributes: {
+      POSITION: { size: 3, value: new Float32Array(positions) },
+    },
+    indices: { size: 1, value: new Uint32Array(indices) },
+  };
+}
+
 function useTerraData() {
-  const [state, setState] = useState({ data: null, error: null });
+  const [state, setState] = useState({ data: null, heightmap: null, error: null });
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${import.meta.env.BASE_URL}data/terra_layout.json`, {
-      signal: controller.signal,
-    })
-      .then((response) => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
+    const loadJson = (path) =>
+      fetch(`${import.meta.env.BASE_URL}${path}`, { signal: controller.signal }).then(
+        (response) => {
+          if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+          return response.json();
+        },
+      );
+    Promise.all([
+      loadJson("data/terra_layout.json"),
+      loadJson("data/heightmap.json"),
+    ])
+      .then(([data, heightmap]) => {
+        if (data.schema_version !== 9)
+          throw new Error(`需要 Terra Layout v9，实际为 v${data.schema_version}`);
+        setState({ data, heightmap, error: null });
       })
-      .then((data) => setState({ data, error: null }))
       .catch((error) => {
-        if (error.name !== "AbortError") setState({ data: null, error });
+        if (error.name !== "AbortError")
+          setState({ data: null, heightmap: null, error });
       });
     return () => controller.abort();
   }, []);
@@ -101,6 +297,8 @@ function useTerraData() {
 }
 
 function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
+  let mapData = MAP_DATA_CACHE.get(visibleNations);
+  if (!mapData) {
   const color = (nation) =>
     COLORS[layout.nations.indexOf(nation) % COLORS.length];
   const nations = visibleNations.map((nation) => ({
@@ -151,6 +349,70 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
   );
   const cityLabels = visibleNations.flatMap((nation) => nation.cities);
   const regionLabels = cityLabels.flatMap((city) => city.regions);
+  const regionRecords = visibleNations.flatMap((nation) =>
+    nation.cities.flatMap((city) =>
+      city.regions.map((region) => ({ nation, city, region })),
+    ),
+  );
+  const mobilePlots = regionRecords.map(({ nation, city, region }) => ({
+    type: "Feature",
+    properties: {
+      kind: "plot",
+      regionKey: `${city.id}:${region.slot_index}`,
+      zh_cn_name: "移动地块",
+      color: color(nation),
+    },
+    geometry: {
+      type: "Polygon",
+      coordinates: [ring(region.mobile_plot.corners)],
+    },
+  }));
+  const connections = regionRecords.flatMap(({ city, region }) =>
+    region.connections.flatMap((connection) => {
+      if (region.slot_index >= connection.neighboring_slot_index) return [];
+      const neighbor = city.regions.find(
+        (item) => item.slot_index === connection.neighboring_slot_index,
+      );
+      return neighbor
+        ? [{
+            point: xy(connection.point),
+          }]
+        : [];
+    }),
+  );
+  const buildingSlots = regionRecords.flatMap(({ region }) =>
+    region.building_slots,
+  );
+    mapData = {
+      nations,
+      cities,
+      regions,
+      cityLabels,
+      regionLabels,
+      mobilePlots,
+      plotLabels: regionRecords.map(({ city, region }) => ({
+        plotKey: `${city.id}:${region.slot_index}`,
+        center: region.mobile_plot.center,
+        zh_cn_name: `${region.zh_cn_name} · 移动地块`,
+      })),
+      connections,
+      buildingSlots,
+    };
+    MAP_DATA_CACHE.set(visibleNations, mapData);
+  }
+  const {
+    nations,
+    cities,
+    regions,
+    cityLabels,
+    regionLabels,
+    mobilePlots,
+    plotLabels,
+    connections,
+    buildingSlots,
+  } = mapData;
+  const showRegions = labelMode !== "nation" && labelMode !== "city";
+  const showPlots = labelMode === "plot" || labelMode === "building";
 
   return [
     new TileLayer({
@@ -271,7 +533,7 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     }),
     new GeoJsonLayer({
       id: "city-regions",
-      visible: labelMode === "region",
+      visible: showRegions,
       data: { type: "FeatureCollection", features: regions },
       pickable: labelMode === "region",
       filled: true,
@@ -291,6 +553,59 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
       lineWidthMinPixels: 1,
       onHover: (info) => onHover(info.object?.properties),
     }),
+    ...(showPlots
+      ? [
+          new ScatterplotLayer({
+            id: "region-connection-points",
+            data: connections,
+            getPosition: (d) => d.point,
+            getFillColor: [128, 220, 200, 230],
+            getLineColor: [6, 12, 12, 230],
+            getRadius: 2.5,
+            radiusUnits: "pixels",
+            radiusMinPixels: 2,
+            stroked: true,
+            lineWidthMinPixels: 0.5,
+          }),
+          new GeoJsonLayer({
+            id: "mobile-plots",
+            data: { type: "FeatureCollection", features: mobilePlots },
+            pickable: true,
+            filled: true,
+            stroked: true,
+            getFillColor: (feature) =>
+              hovered?.kind === "plot" &&
+              hovered.regionKey === feature.properties.regionKey
+                ? [244, 213, 143, 145]
+                : [...feature.properties.color, 32],
+            getLineColor: (feature) => [...feature.properties.color, 225],
+            getLineWidth: (feature) =>
+              hovered?.kind === "plot" &&
+              hovered.regionKey === feature.properties.regionKey
+                ? 2.8
+                : 1.4,
+            lineWidthUnits: "pixels",
+            lineWidthMinPixels: 1,
+            onHover: (info) => onHover(info.object?.properties),
+          }),
+        ]
+      : []),
+    ...(labelMode === "building"
+      ? [
+          new ScatterplotLayer({
+            id: "building-slots",
+            data: buildingSlots,
+            getPosition: (d) => xy(d.center),
+            getFillColor: (d) => [...buildingColor(d.building_id), 225],
+            getLineColor: [8, 13, 13, 220],
+            getRadius: 2.5,
+            radiusUnits: "pixels",
+            radiusMinPixels: 1.5,
+            stroked: true,
+            lineWidthMinPixels: 0.5,
+          }),
+        ]
+      : []),
     ...(labelMode === "nation"
       ? [
           new TextLayer({
@@ -342,6 +657,23 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
           }),
         ]
       : []),
+    ...(labelMode === "plot"
+      ? [
+          new TextLayer({
+            id: "mobile-plot-labels",
+            data: plotLabels,
+            getPosition: (d) => xy(d.center),
+            getText: (d) => d.zh_cn_name,
+            getColor: [244, 221, 169, 240],
+            getSize: 10,
+            sizeUnits: "pixels",
+            fontWeight: 600,
+            outlineWidth: 3,
+            outlineColor: [5, 10, 10, 240],
+            ...FONT,
+          }),
+        ]
+      : []),
   ];
 }
 
@@ -355,7 +687,7 @@ const Header = memo(function Header({ layout }) {
       <div className="brand">
         <span className="brand-mark" />
         <div>
-          <p>TERRA ARCHIVE / 01</p>
+          <p>TERRA LAYOUT / V9</p>
           <h1>Show Me Terra</h1>
         </div>
       </div>
@@ -510,13 +842,16 @@ const Explorer = memo(function Explorer({
 });
 
 export default function App() {
-  const { data: layout, error } = useTerraData();
+  const { data: layout, heightmap, error } = useTerraData();
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [hovered, setHovered] = useState(null);
+  const [viewMode, setViewMode] = useState("map");
+  const [showTerrainLabels, setShowTerrainLabels] = useState(true);
   const [initialViewState, setInitialViewState] = useState(HOME);
   const [labelMode, setLabelMode] = useState(() => getLabelMode(HOME.zoom));
   const liveView = useRef(HOME);
+  const liveViewMode = useRef("map");
   const liveLabelMode = useRef(getLabelMode(HOME.zoom));
   const coordinatesRef = useRef(null);
   const coordinateFrame = useRef(0);
@@ -524,21 +859,41 @@ export default function App() {
 
   const setMapView = useCallback((target, zoom) => {
     const next = {
+      ...liveView.current,
       target: [target[0], target[1], target[2] ?? 0],
       zoom,
       minZoom: HOME.minZoom,
       maxZoom: HOME.maxZoom,
     };
     liveView.current = next;
-    const nextMode = getLabelMode(zoom);
-    if (nextMode !== liveLabelMode.current) {
-      liveLabelMode.current = nextMode;
-      setLabelMode(nextMode);
+    if (liveViewMode.current === "map") {
+      const nextMode = getLabelMode(zoom);
+      if (nextMode !== liveLabelMode.current) {
+        liveLabelMode.current = nextMode;
+        setLabelMode(nextMode);
+      }
     }
     setInitialViewState(next);
     if (coordinatesRef.current) {
       coordinatesRef.current.textContent = `X ${number(next.target[0])} · Z ${number(-next.target[1])}`;
     }
+  }, []);
+  const switchView = useCallback((mode) => {
+    if (mode === liveViewMode.current) return;
+    liveViewMode.current = mode;
+    setViewMode(mode);
+    const home = mode === "terrain" ? TERRAIN_HOME : HOME;
+    liveView.current = home;
+    if (mode === "map") {
+      const nextMode = getLabelMode(home.zoom);
+      liveLabelMode.current = nextMode;
+      setLabelMode(nextMode);
+    }
+    hoveredKey.current = "";
+    setHovered(null);
+    setInitialViewState({ ...home, target: [...home.target] });
+    if (coordinatesRef.current)
+      coordinatesRef.current.textContent = "X 0 · Z 0";
   }, []);
   const hoverItem = useCallback((item) => {
     const key = item
@@ -555,10 +910,12 @@ export default function App() {
       maxZoom: HOME.maxZoom,
     };
     const zoom = Array.isArray(next.zoom) ? next.zoom[0] : next.zoom;
-    const nextMode = getLabelMode(zoom);
-    if (nextMode !== liveLabelMode.current) {
-      liveLabelMode.current = nextMode;
-      setLabelMode(nextMode);
+    if (liveViewMode.current === "map") {
+      const nextMode = getLabelMode(zoom);
+      if (nextMode !== liveLabelMode.current) {
+        liveLabelMode.current = nextMode;
+        setLabelMode(nextMode);
+      }
     }
     if (coordinateFrame.current) return;
     coordinateFrame.current = requestAnimationFrame(() => {
@@ -602,6 +959,106 @@ export default function App() {
         : [],
     [layout, visibleNations, hovered, hoverItem, labelMode],
   );
+  const terrainMetrics = useMemo(
+    () =>
+      layout && heightmap
+        ? calculateTerrainMetrics(layout.boundary, heightmap)
+        : null,
+    [heightmap, layout],
+  );
+  const terrainLayers = useMemo(() => {
+    if (!layout || !heightmap || !terrainMetrics || viewMode !== "terrain")
+      return [];
+    const boundaryData = createTerrainBoundaries(layout);
+    return [
+      new SimpleMeshLayer({
+        id: "terrain-solid-base",
+        data: [{}],
+        mesh: createTerrainBaseMesh(layout.boundary, heightmap, terrainMetrics),
+        _instanced: false,
+        getPosition: [0, 0, 0],
+        getColor: [190, 193, 193, 255],
+        material: {
+          ambient: 0.72,
+          diffuse: 0.45,
+          shininess: 8,
+          specularColor: [255, 255, 255],
+        },
+        pickable: false,
+      }),
+      new TerrainLayer({
+        id: "terra-heightmap",
+        operation: "terrain+draw",
+        elevationData: `${import.meta.env.BASE_URL}terrain/elevation.png`,
+        texture: `${import.meta.env.BASE_URL}terrain/terrain-texture.png`,
+        bounds: getTerrainBounds(layout.boundary),
+        elevationDecoder: {
+          rScaler: 256 * terrainMetrics.scale,
+          gScaler: terrainMetrics.scale,
+          bScaler: 0,
+          offset:
+            TERRAIN_BASE_HEIGHT +
+            (Math.min(0, Math.floor(heightmap.statistics.minimum_y)) -
+              terrainMetrics.min) *
+              terrainMetrics.scale,
+        },
+        meshMaxError: 16,
+        color: [210, 213, 213],
+        material: {
+          ambient: 0.68,
+          diffuse: 0.5,
+          shininess: 12,
+          specularColor: [255, 255, 255],
+        },
+      }),
+      new GeoJsonLayer({
+        id: "terrain-boundaries",
+        data: boundaryData,
+        filled: false,
+        stroked: true,
+        pickable: false,
+        getLineColor: [91, 96, 96, 225],
+        getLineWidth: ({ properties }) =>
+          properties.kind === "terra"
+            ? 2.5
+            : properties.kind === "nation"
+              ? 1.4
+              : properties.kind === "city"
+                ? 1.2
+                : properties.kind === "region"
+                  ? 0.7
+                  : 0.45,
+        lineWidthUnits: "pixels",
+        lineWidthMinPixels: 0.35,
+        extensions: [new TerrainExtension()],
+        terrainDrawMode: "offset",
+      }),
+      new TextLayer({
+        id: "terrain-nation-labels",
+        data: layout.nations.filter((nation) => !nation.underground),
+        visible: showTerrainLabels,
+        ...FONT,
+        billboard: true,
+        getPosition: (nation) => [
+          nation.center.x,
+          -nation.center.z,
+          TERRAIN_LABEL_LIFT,
+        ],
+        getText: (nation) => nation.zh_cn_name,
+        getSize: 13,
+        sizeUnits: "pixels",
+        sizeMinPixels: 8,
+        sizeMaxPixels: 17,
+        getColor: [5, 5, 5, 255],
+        outlineColor: [255, 255, 255, 245],
+        outlineWidth: 0.18,
+        fontWeight: 700,
+        pickable: false,
+        extensions: [new TerrainExtension()],
+        terrainDrawMode: "offset",
+      }),
+    ];
+  }, [heightmap, layout, showTerrainLabels, terrainMetrics, viewMode]);
   const zoomBy = (delta) => {
     const current = liveView.current;
     const zoom = Array.isArray(current.zoom) ? current.zoom[0] : current.zoom;
@@ -609,6 +1066,13 @@ export default function App() {
       current.target ?? HOME.target,
       Math.max(HOME.minZoom, Math.min(HOME.maxZoom, zoom + delta)),
     );
+  };
+  const resetView = () => {
+    const home = viewMode === "terrain" ? TERRAIN_HOME : HOME;
+    liveView.current = home;
+    setInitialViewState({ ...home, target: [...home.target] });
+    if (coordinatesRef.current)
+      coordinatesRef.current.textContent = "X 0 · Z 0";
   };
 
   if (error)
@@ -628,25 +1092,47 @@ export default function App() {
     );
   return (
     <div id="app">
-      <div id="map" aria-label="Terra 地图">
+      <div
+        id="map"
+        aria-label={viewMode === "terrain" ? "Terra 三维地形" : "Terra 二维地图"}
+        onContextMenu={
+          viewMode === "terrain" ? (event) => event.preventDefault() : undefined
+        }
+      >
         <DeckGL
-          views={ORTHO_VIEW}
+          views={viewMode === "terrain" ? ORBIT_VIEW : ORTHO_VIEW}
           initialViewState={initialViewState}
           onViewStateChange={changeView}
-          controller={CONTROLLER}
-          layers={layers}
+          controller={viewMode === "terrain" ? true : CONTROLLER}
+          layers={viewMode === "terrain" ? terrainLayers : layers}
           useDevicePixels={DEVICE_PIXEL_RATIO}
           getCursor={GET_CURSOR}
         />
       </div>
       <Header layout={layout} />
-      <Explorer
-        layout={layout}
-        filter={filter}
-        setFilter={setFilter}
-        query={query}
-        setQuery={setQuery}
-      />
+      <div className="view-switch" role="group" aria-label="地图视图">
+        <button className={viewMode === "map" ? "active" : ""} onClick={() => switchView("map")}>二维地图</button>
+        <button className={viewMode === "terrain" ? "active" : ""} onClick={() => switchView("terrain")}>三维地形</button>
+      </div>
+      {viewMode === "terrain" && (
+        <label className="terrain-label-toggle">
+          <input
+            type="checkbox"
+            checked={showTerrainLabels}
+            onChange={(event) => setShowTerrainLabels(event.target.checked)}
+          />
+          <span>显示国家名称</span>
+        </label>
+      )}
+      {viewMode === "map" && (
+        <Explorer
+          layout={layout}
+          filter={filter}
+          setFilter={setFilter}
+          query={query}
+          setQuery={setQuery}
+        />
+      )}
       <div className="map-tools">
         <button title="放大" onClick={() => zoomBy(0.6)}>
           +
@@ -656,17 +1142,48 @@ export default function App() {
         </button>
         <button
           title="显示完整地图"
-          onClick={() => setMapView(HOME.target, HOME.zoom)}
+          onClick={resetView}
         >
           ⌖
         </button>
       </div>
+      {viewMode === "terrain" && (
+        <aside className="terrain-elevation-legend" aria-label="地形高度图例">
+          <div className="terrain-legend-title">
+            <span>地形高度</span>
+            <small>
+              Y / 方块 · {terrainMetrics?.scale.toFixed(1)}×
+            </small>
+          </div>
+          <div
+            className="terrain-color-scale"
+            style={{ background: TERRAIN_GRADIENT }}
+          />
+          <div className="terrain-height-ticks">
+            <span>{Math.round(terrainMetrics?.min ?? 0)}</span>
+            <span>
+              {Math.round(
+                ((terrainMetrics?.min ?? 0) + (terrainMetrics?.max ?? 0)) / 2,
+              )}
+            </span>
+            <span>{Math.round(terrainMetrics?.max ?? 0)}</span>
+          </div>
+          <div className="terrain-height-caption">
+            <span>低</span>
+            <span>高</span>
+          </div>
+        </aside>
+      )}
       <footer className="statusbar">
         <span className="status-dot" />
         <span>MAP ONLINE</span>
         <span className="divider" />
         <span ref={coordinatesRef}>X 0 · Z 0</span>
-        <span className="status-help">拖拽移动 · 滚轮缩放 · 悬停高亮</span>
+        <span className="status-help">
+          {viewMode === "terrain"
+            ? `拖拽旋转 · 右键平移 · 滚轮缩放 · 高程夸张 ${terrainMetrics?.scale.toFixed(1)}×`
+            : "拖拽移动 · 滚轮缩放 · 悬停高亮"}
+        </span>
       </footer>
     </div>
   );

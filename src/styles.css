@@ -348,6 +348,97 @@ kbd {
   border-color: #b794c7;
   border-radius: 50%;
 }
+.view-switch {
+  position: absolute;
+  z-index: 7;
+  top: 106px;
+  left: 50%;
+  display: flex;
+  padding: 3px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  background: rgba(8, 13, 13, 0.9);
+  backdrop-filter: blur(14px);
+}
+.view-switch button {
+  min-width: 78px;
+  padding: 8px 14px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 10px;
+  cursor: pointer;
+}
+.view-switch button:hover {
+  color: var(--ink);
+}
+.view-switch button.active {
+  color: #151716;
+  background: var(--accent);
+}
+.terrain-label-toggle {
+  position: absolute;
+  z-index: 7;
+  top: 151px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  background: rgba(8, 13, 13, 0.9);
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+  backdrop-filter: blur(14px);
+}
+.terrain-label-toggle input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.terrain-elevation-legend {
+  position: absolute;
+  z-index: 6;
+  right: 68px;
+  bottom: 48px;
+  width: 210px;
+  padding: 12px 13px 10px;
+  border: 1px solid var(--line);
+  background: rgba(8, 13, 13, 0.9);
+  backdrop-filter: blur(14px);
+}
+.terrain-legend-title,
+.terrain-height-ticks,
+.terrain-height-caption {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.terrain-legend-title {
+  margin-bottom: 9px;
+  color: var(--ink);
+  font-size: 11px;
+}
+.terrain-legend-title small,
+.terrain-height-ticks,
+.terrain-height-caption {
+  color: var(--muted);
+  font: 8px "DM Mono", monospace;
+}
+.terrain-color-scale {
+  height: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+.terrain-height-ticks {
+  margin-top: 5px;
+}
+.terrain-height-caption {
+  margin-top: 4px;
+  color: #66736f;
+}
 .map-tools {
   position: absolute;
   z-index: 6;
@@ -480,6 +571,9 @@ kbd {
   .map-tools {
     right: 10px;
     top: 88px;
+  }
+  .view-switch {
+    top: 84px;
   }
   .status-help {
     display: none;
