@@ -1,0 +1,20 @@
+{
+  "name": "show-me-terra",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A deck.gl explorer for the Terra Minecraft world layout",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "deck.gl": "^9.3.10",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "vite": "^8.2.2"
+  }
+}
