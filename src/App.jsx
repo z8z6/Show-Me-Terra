@@ -35,6 +35,8 @@ const TERRAIN_GRADIENT = `linear-gradient(90deg, ${TERRAIN_PALETTE.map(
   (color, index) =>
     `rgb(${color.join(" ")}) ${(index / (TERRAIN_PALETTE.length - 1)) * 100}%`,
 ).join(", ")})`;
+const versionedAsset = (path) =>
+  `${import.meta.env.BASE_URL}${path}?v=${encodeURIComponent(__BUILD_ID__)}`;
 const HOME = { target: [0, 0, 0], zoom: -6.35, minZoom: -8, maxZoom: 2 };
 const TERRAIN_HOME = {
   target: [0, 0, 3000],
@@ -272,7 +274,7 @@ function useTerraData() {
   useEffect(() => {
     const controller = new AbortController();
     const loadJson = (path) =>
-      fetch(`${import.meta.env.BASE_URL}${path}`, { signal: controller.signal }).then(
+      fetch(versionedAsset(path), { signal: controller.signal }).then(
         (response) => {
           if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
           return response.json();
@@ -989,8 +991,8 @@ export default function App() {
       new TerrainLayer({
         id: "terra-heightmap",
         operation: "terrain+draw",
-        elevationData: `${import.meta.env.BASE_URL}terrain/elevation.png`,
-        texture: `${import.meta.env.BASE_URL}terrain/terrain-texture.png`,
+        elevationData: versionedAsset("terrain/elevation.png"),
+        texture: versionedAsset("terrain/terrain-texture.png"),
         bounds: getTerrainBounds(layout.boundary),
         elevationDecoder: {
           rScaler: 256 * terrainMetrics.scale,
