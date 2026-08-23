@@ -104,11 +104,9 @@ for (let y = 0; y < outputSize; y++) {
 }
 const elevationOffset = Math.min(0, Math.floor(source.statistics.minimum_y));
 const palette = [
-  [26, 152, 80],
-  [145, 207, 96],
-  [255, 255, 191],
-  [252, 141, 89],
-  [215, 48, 39]
+  [24, 112, 196],
+  [252, 249, 238],
+  [164, 30, 45]
 ];
 const terrainColor = height => {
   const value = Math.max(0, Math.min(1, (height - min) / Math.max(1, max - min)));
@@ -122,7 +120,10 @@ fs.mkdirSync(outputDir, {recursive: true});
 writePng('elevation.png', (x, y) => {
   const encodedHeight = Math.max(
     0,
-    Math.min(65535, Math.round(sampleTerrain(x / 255, y / 255) - elevationOffset))
+    Math.min(
+      65535,
+      Math.round(sampleTerrain(x / 255, y / 255) - elevationOffset)
+    )
   );
   return [encodedHeight >> 8, encodedHeight & 255, 0, 255];
 });
@@ -130,10 +131,7 @@ writePng('terrain-texture.png', (x, y) => {
   const u = x / 255;
   const v = y / 255;
   const height = sampleTerrain(u, v);
-  const dx = sampleTerrain(Math.min(1, u + 1 / 255), v) - sampleTerrain(Math.max(0, u - 1 / 255), v);
-  const dz = sampleTerrain(u, Math.min(1, v + 1 / 255)) - sampleTerrain(u, Math.max(0, v - 1 / 255));
-  const shade = Math.max(.68, Math.min(1.15, .94 + (dx - dz) * .012));
-  const color = terrainColor(height).map(channel => Math.max(0, Math.min(255, Math.round(channel * shade))));
+  const color = terrainColor(height);
   return [...color, 255];
 });
 
@@ -141,5 +139,6 @@ console.log(
   `Generated ${outputSize} × ${outputSize} terrain assets for Terra bounds ` +
   `[${terrainExtent.minX}, ${terrainExtent.minZ}]–[${terrainExtent.maxX}, ${terrainExtent.maxZ}] ` +
   `from ${source.width} × ${source.depth} samples ` +
-  `(range ${min.toFixed(1)}–${max.toFixed(1)}, elevation offset ${elevationOffset}).`
+  `(range ${min.toFixed(1)}–${max.toFixed(1)}, baseline 0, ` +
+  `elevation offset ${elevationOffset}).`
 );

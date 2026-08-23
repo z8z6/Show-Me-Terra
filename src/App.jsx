@@ -4,7 +4,6 @@ import {
   GeoJsonLayer,
   OrbitView,
   OrthographicView,
-  ScatterplotLayer,
   SimpleMeshLayer,
   TerrainLayer,
   TextLayer,
@@ -25,18 +24,43 @@ const COLORS = [
   [151, 105, 93],
 ];
 const TERRAIN_PALETTE = [
-  [26, 152, 80],
-  [145, 207, 96],
-  [255, 255, 191],
-  [252, 141, 89],
-  [215, 48, 39],
+  [24, 112, 196],
+  [252, 249, 238],
+  [164, 30, 45],
 ];
+const WHITE_TERRAIN_TEXTURE =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8////fwAJ+wP9KobjigAAAABJRU5ErkJggg==";
 const TERRAIN_GRADIENT = `linear-gradient(90deg, ${TERRAIN_PALETTE.map(
   (color, index) =>
     `rgb(${color.join(" ")}) ${(index / (TERRAIN_PALETTE.length - 1)) * 100}%`,
 ).join(", ")})`;
+const terrainPaletteColor = (height, min, max) => {
+  const ratio = Math.max(0, Math.min(1, (height - min) / Math.max(1, max - min)));
+  const scaled = ratio * (TERRAIN_PALETTE.length - 1);
+  const index = Math.min(Math.floor(scaled), TERRAIN_PALETTE.length - 2);
+  const mix = scaled - index;
+  return TERRAIN_PALETTE[index].map((channel, channelIndex) =>
+    Math.round(
+      channel * (1 - mix) + TERRAIN_PALETTE[index + 1][channelIndex] * mix,
+    ),
+  );
+};
 const versionedAsset = (path) =>
   `${import.meta.env.BASE_URL}${path}?v=${encodeURIComponent(__BUILD_ID__)}`;
+async function readPossiblyGzippedJson(response, path) {
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  }
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error(`浏览器不支持解压国家详情: ${path}`);
+  }
+  const stream = new Blob([buffer])
+    .stream()
+    .pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).json();
+}
 const HOME = { target: [0, 0, 0], zoom: -6.35, minZoom: -8, maxZoom: 2 };
 const TERRAIN_HOME = {
   target: [0, 0, 3000],
@@ -50,13 +74,15 @@ const CITY_LABEL_ZOOM = -5;
 const REGION_LABEL_ZOOM = -3.5;
 const PLOT_ZOOM = -2.5;
 const BUILDING_ZOOM = -2;
-const TERRAIN_BASE_HEIGHT = 600;
 const TERRAIN_TARGET_RELIEF = 9000;
 const TERRAIN_MIN_SCALE = 8;
 const TERRAIN_MAX_SCALE = 64;
 const TERRAIN_BOUNDARY_LIFT = 36;
 const TERRAIN_BOUNDARY_STEP = 512;
 const TERRAIN_LABEL_LIFT = 1200;
+const FORMATION_REVEAL_DURATION = 14000;
+const FORMATION_NATIONS_END = 0.2;
+const FORMATION_CITIES_END = 0.45;
 const DEVICE_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 1.5);
 const FONT = {
   fontFamily: '"Noto Sans SC", "Microsoft YaHei", sans-serif',
@@ -79,6 +105,23 @@ const GET_CURSOR = ({ isDragging, isHovering }) =>
   isDragging ? "grabbing" : isHovering ? "pointer" : "grab";
 const xy = ({ x, z }) => [x, -z];
 const ring = (points) => [...points.map(xy), xy(points[0])];
+const chunkAreaCorners = ({
+  min_chunk_x,
+  min_chunk_z,
+  width_chunks,
+  length_chunks,
+}) => {
+  const minX = min_chunk_x * 16;
+  const minZ = min_chunk_z * 16;
+  const maxX = minX + width_chunks * 16;
+  const maxZ = minZ + length_chunks * 16;
+  return [
+    { x: minX, z: minZ },
+    { x: maxX, z: minZ },
+    { x: maxX, z: maxZ },
+    { x: minX, z: maxZ },
+  ];
+};
 const number = (value) => Math.round(value).toLocaleString("zh-CN");
 const buildingColor = (id) => {
   let hash = 0;
@@ -98,6 +141,36 @@ const getLabelMode = (zoom) =>
       : "nation";
 const POLYGON_CENTER_CACHE = new WeakMap();
 const MAP_DATA_CACHE = new WeakMap();
+const BUILDING_DATA_CACHE = new WeakMap();
+const REGION_ROAD_DATA_CACHE = new WeakMap();
+const UNIT_BOX_MESH = {
+  attributes: {
+    POSITION: {
+      size: 3,
+      value: new Float32Array([
+        -0.5, -0.5, -0.5,
+         0.5, -0.5, -0.5,
+         0.5,  0.5, -0.5,
+        -0.5,  0.5, -0.5,
+        -0.5, -0.5,  0.5,
+         0.5, -0.5,  0.5,
+         0.5,  0.5,  0.5,
+        -0.5,  0.5,  0.5,
+      ]),
+    },
+  },
+  indices: {
+    size: 1,
+    value: new Uint16Array([
+      0, 2, 1, 0, 3, 2,
+      4, 5, 6, 4, 6, 7,
+      0, 1, 5, 0, 5, 4,
+      1, 2, 6, 1, 6, 5,
+      2, 3, 7, 2, 7, 6,
+      3, 0, 4, 3, 4, 7,
+    ]),
+  },
+};
 function polygonCenter(points) {
   if (!points?.length) return { x: 0, z: 0 };
   const cached = POLYGON_CENTER_CACHE.get(points);
@@ -242,9 +315,8 @@ function createTerrainBaseMesh(boundary, heightmap, metrics) {
   const top = boundary.map((point) => [
     point.x,
     -point.z,
-    TERRAIN_BASE_HEIGHT +
-      (sampleTerrainHeight(heightmap, point.x, point.z) - metrics.min) *
-        metrics.scale,
+    Math.max(0, sampleTerrainHeight(heightmap, point.x, point.z)) *
+      metrics.scale,
   ]);
   const positions = [
     ...top.flat(),
@@ -269,6 +341,94 @@ function createTerrainBaseMesh(boundary, heightmap, metrics) {
   };
 }
 
+function getRegionGroundY(region, heightmap) {
+  const plot = region.mobile_plot;
+  const samplePoints = [plot.center, ...(plot.corners ?? region.boundary ?? [])];
+  return Math.max(
+    ...samplePoints.map((point) =>
+      sampleTerrainHeight(heightmap, point.x, point.z),
+    ),
+  );
+}
+
+function createTerrainStructures(layout, nationDetail, metrics, heightmap) {
+  const cityById = new Map();
+  const regionGroundByKey = new Map();
+  const foundations = layout.nations
+    .filter((nation) => !nation.underground)
+    .flatMap((nation) => {
+      return nation.cities.flatMap((city) => {
+        cityById.set(city.id, city);
+        return city.regions.flatMap((region) => {
+          const groundY = getRegionGroundY(region, heightmap);
+          if (groundY < 0) return [];
+          const surface = groundY * metrics.scale;
+          const height = 48 * metrics.scale;
+          regionGroundByKey.set(`${city.id}:${region.slot_index}`, groundY);
+          return [
+            {
+              position: [
+                region.mobile_plot.center.x,
+                -region.mobile_plot.center.z,
+                surface + height / 2,
+              ],
+              scale: [
+                region.mobile_plot.half_size_x * 2,
+                region.mobile_plot.half_size_z * 2,
+                height,
+              ],
+              color: [
+                ...terrainPaletteColor(
+                  groundY + 24,
+                  metrics.min,
+                  metrics.max,
+                ),
+                255,
+              ],
+            },
+          ];
+        });
+      });
+    });
+
+  const buildings = nationDetail
+    ? nationDetail.regions.flatMap((region) => {
+        const city = cityById.get(region.city_id);
+        if (!city || city.terrain_profile?.ground_y < 0) return [];
+        const groundY =
+          regionGroundByKey.get(`${region.city_id}:${region.slot_index}`) ??
+          city.terrain_profile?.ground_y ??
+          80;
+        if (groundY < 0) return [];
+        const surface = groundY * metrics.scale;
+        const height = 16 * metrics.scale;
+        return region.building_slots.map((slot) => {
+          const area = slot.chunk_area;
+          const width = area.width_chunks * 16;
+          const depth = area.length_chunks * 16;
+          return {
+            position: [
+              area.min_chunk_x * 16 + width / 2,
+              -(area.min_chunk_z * 16 + depth / 2),
+              surface + 48 * metrics.scale + height / 2,
+            ],
+            scale: [width, depth, height],
+            color: [
+              ...terrainPaletteColor(
+                groundY + 56,
+                metrics.min,
+                metrics.max,
+              ),
+              255,
+            ],
+          };
+        });
+      })
+    : [];
+
+  return { foundations, buildings };
+}
+
 function useTerraData() {
   const [state, setState] = useState({ data: null, heightmap: null, error: null });
   useEffect(() => {
@@ -285,8 +445,8 @@ function useTerraData() {
       loadJson("data/heightmap.json"),
     ])
       .then(([data, heightmap]) => {
-        if (data.schema_version !== 9)
-          throw new Error(`需要 Terra Layout v9，实际为 v${data.schema_version}`);
+        if (data.schema_version !== 14)
+          throw new Error(`需要 Terra Layout v14，实际为 v${data.schema_version}`);
         setState({ data, heightmap, error: null });
       })
       .catch((error) => {
@@ -298,7 +458,17 @@ function useTerraData() {
   return state;
 }
 
-function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
+function createLayers(
+  layout,
+  visibleNations,
+  hovered,
+  onHover,
+  labelMode,
+  showLabels,
+  formationProgress,
+  nationDetail,
+  selectedNationId,
+) {
   let mapData = MAP_DATA_CACHE.get(visibleNations);
   if (!mapData) {
   const color = (nation) =>
@@ -343,6 +513,7 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
           nationId: nation.id,
           nationName: nation.zh_cn_name,
           color: color(nation),
+          formationOrder: (region.slot_index + 1) / city.regions.length,
           boundary: undefined,
         },
         geometry: { type: "Polygon", coordinates: [ring(region.boundary)] },
@@ -350,55 +521,35 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     ),
   );
   const cityLabels = visibleNations.flatMap((nation) => nation.cities);
-  const regionLabels = cityLabels.flatMap((city) => city.regions);
-  const regionRecords = visibleNations.flatMap((nation) =>
+  const roads = visibleNations.flatMap((nation) =>
     nation.cities.flatMap((city) =>
-      city.regions.map((region) => ({ nation, city, region })),
+      city.roads.map((road) => ({
+        type: "Feature",
+        properties: {
+          kind: "road",
+          roadKey: `${city.id}:${road.from_plot_id}:${road.to_plot_id}`,
+          cityId: city.id,
+          fromPlotId: road.from_plot_id,
+          toPlotId: road.to_plot_id,
+          formationOrder:
+            (Math.max(road.from_plot_id, road.to_plot_id) + 1) /
+            city.regions.length,
+        },
+        geometry: {
+          type: "Polygon",
+          coordinates: [
+            ring(road.block_area?.corners ?? chunkAreaCorners(road.chunk_area)),
+          ],
+        },
+      })),
     ),
-  );
-  const mobilePlots = regionRecords.map(({ nation, city, region }) => ({
-    type: "Feature",
-    properties: {
-      kind: "plot",
-      regionKey: `${city.id}:${region.slot_index}`,
-      zh_cn_name: "移动地块",
-      color: color(nation),
-    },
-    geometry: {
-      type: "Polygon",
-      coordinates: [ring(region.mobile_plot.corners)],
-    },
-  }));
-  const connections = regionRecords.flatMap(({ city, region }) =>
-    region.connections.flatMap((connection) => {
-      if (region.slot_index >= connection.neighboring_slot_index) return [];
-      const neighbor = city.regions.find(
-        (item) => item.slot_index === connection.neighboring_slot_index,
-      );
-      return neighbor
-        ? [{
-            point: xy(connection.point),
-          }]
-        : [];
-    }),
-  );
-  const buildingSlots = regionRecords.flatMap(({ region }) =>
-    region.building_slots,
   );
     mapData = {
       nations,
       cities,
       regions,
       cityLabels,
-      regionLabels,
-      mobilePlots,
-      plotLabels: regionRecords.map(({ city, region }) => ({
-        plotKey: `${city.id}:${region.slot_index}`,
-        center: region.mobile_plot.center,
-        zh_cn_name: `${region.zh_cn_name} · 移动地块`,
-      })),
-      connections,
-      buildingSlots,
+      roads,
     };
     MAP_DATA_CACHE.set(visibleNations, mapData);
   }
@@ -407,14 +558,98 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     cities,
     regions,
     cityLabels,
-    regionLabels,
-    mobilePlots,
-    plotLabels,
-    connections,
-    buildingSlots,
+    roads,
   } = mapData;
-  const showRegions = labelMode !== "nation" && labelMode !== "city";
-  const showPlots = labelMode === "plot" || labelMode === "building";
+  const formationActive = formationProgress !== null;
+  const phaseProgress = (start, end) =>
+    Math.max(0, Math.min(1, (formationProgress - start) / (end - start)));
+  const nationProgress = formationActive
+    ? phaseProgress(0, FORMATION_NATIONS_END)
+    : 1;
+  const cityProgress = formationActive
+    ? phaseProgress(FORMATION_NATIONS_END, FORMATION_CITIES_END)
+    : 1;
+  const regionProgress = formationActive
+    ? phaseProgress(FORMATION_CITIES_END, 1)
+    : 1;
+  const formedNations = formationActive
+    ? nations.slice(0, Math.ceil(nations.length * nationProgress))
+    : nations;
+  const formedCities = formationActive
+    ? cities.slice(0, Math.ceil(cities.length * cityProgress))
+    : cities;
+  const formedRegions = formationActive
+    ? regions.filter(
+        (feature) => feature.properties.formationOrder <= regionProgress,
+      )
+    : regions;
+  const formedRoads = formationActive
+    ? roads.filter(
+        (feature) => feature.properties.formationOrder <= regionProgress,
+      )
+    : roads;
+  const formedNationLabels = formationActive
+    ? visibleNations.slice(
+        0,
+        Math.ceil(visibleNations.length * nationProgress),
+      )
+    : visibleNations;
+  const formedCityLabels = formationActive
+    ? cityLabels.slice(0, Math.ceil(cityLabels.length * cityProgress))
+    : cityLabels;
+  const showRegions = formationActive
+    ? regionProgress > 0
+    : labelMode !== "nation" && labelMode !== "city";
+  const showPlots = formationActive
+    ? regionProgress > 0
+    : labelMode === "plot" || labelMode === "building";
+  const showRegionRoads =
+    Boolean(nationDetail) &&
+    (labelMode === "plot" || labelMode === "building");
+  let regionRoads = [];
+  if (showRegionRoads) {
+    regionRoads = REGION_ROAD_DATA_CACHE.get(nationDetail);
+    if (!regionRoads) {
+      regionRoads = nationDetail.regions.flatMap((region) =>
+        region.roads.map((road) => ({
+          type: "Feature",
+          properties: {
+            kind: "region-road",
+            cityId: region.city_id,
+            regionId: region.id,
+            roadId: road.id,
+            roadClass: road.road_class,
+          },
+          geometry: {
+            type: "Polygon",
+            coordinates: [ring(chunkAreaCorners(road.chunk_area))],
+          },
+        })),
+      );
+      REGION_ROAD_DATA_CACHE.set(nationDetail, regionRoads);
+    }
+  }
+  let buildingSlots = [];
+  if (nationDetail && labelMode === "building") {
+    buildingSlots = BUILDING_DATA_CACHE.get(nationDetail);
+    if (!buildingSlots) {
+      buildingSlots = nationDetail.regions.flatMap((region) =>
+        region.building_slots.map((slot) => ({
+          type: "Feature",
+          properties: {
+            ...slot,
+            cityId: region.city_id,
+            regionId: region.id,
+          },
+          geometry: {
+            type: "Polygon",
+            coordinates: [ring(chunkAreaCorners(slot.chunk_area))],
+          },
+        })),
+      );
+      BUILDING_DATA_CACHE.set(nationDetail, buildingSlots);
+    }
+  }
 
   return [
     new TileLayer({
@@ -447,7 +682,10 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
         const features = [
           { type: "Feature", geometry: { type: "Polygon", coordinates } },
         ];
-        const gridStep = 1024;
+        // Minecraft 的一个 Chunk 是 16 × 16 方块；远景使用稀疏网格，
+        // 放大到地块层级后显示完整 Chunk 单位网格。
+        const gridStep =
+          labelMode === "plot" || labelMode === "building" ? 16 : 1024;
         for (
           let x = Math.ceil(minX / gridStep) * gridStep;
           x < maxX;
@@ -496,13 +734,17 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     }),
     new GeoJsonLayer({
       id: "nations",
-      data: { type: "FeatureCollection", features: nations },
+      data: { type: "FeatureCollection", features: formedNations },
       pickable: labelMode === "nation",
       filled: true,
       stroked: true,
       getFillColor: (f) => [
         ...f.properties.color,
-        hovered?.kind === "nation" && hovered.id === f.properties.id ? 105 : 47,
+        hovered?.kind === "nation" && hovered.id === f.properties.id
+          ? 105
+          : selectedNationId && selectedNationId !== f.properties.id
+            ? 18
+            : 47,
       ],
       getLineColor: (f) =>
         f.properties.underground
@@ -516,7 +758,7 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     }),
     new GeoJsonLayer({
       id: "cities",
-      data: { type: "FeatureCollection", features: cities },
+      data: { type: "FeatureCollection", features: formedCities },
       pickable: labelMode === "city",
       filled: true,
       stroked: true,
@@ -536,8 +778,8 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     new GeoJsonLayer({
       id: "city-regions",
       visible: showRegions,
-      data: { type: "FeatureCollection", features: regions },
-      pickable: labelMode === "region",
+      data: { type: "FeatureCollection", features: formedRegions },
+      pickable: labelMode === "region" || labelMode === "plot",
       filled: true,
       stroked: true,
       getFillColor: (f) =>
@@ -557,62 +799,62 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
     }),
     ...(showPlots
       ? [
-          new ScatterplotLayer({
-            id: "region-connection-points",
-            data: connections,
-            getPosition: (d) => d.point,
-            getFillColor: [128, 220, 200, 230],
-            getLineColor: [6, 12, 12, 230],
-            getRadius: 2.5,
-            radiusUnits: "pixels",
-            radiusMinPixels: 2,
+          new GeoJsonLayer({
+            id: "urban-roads",
+            data: { type: "FeatureCollection", features: formedRoads },
+            pickable: false,
+            filled: true,
             stroked: true,
+            getFillColor: [164, 151, 124, 135],
+            getLineColor: [211, 197, 165, 190],
+            getLineWidth: 0.8,
+            lineWidthUnits: "pixels",
             lineWidthMinPixels: 0.5,
           }),
           new GeoJsonLayer({
-            id: "mobile-plots",
-            data: { type: "FeatureCollection", features: mobilePlots },
-            pickable: true,
+            id: "region-roads",
+            data: { type: "FeatureCollection", features: regionRoads },
+            visible: showRegionRoads,
+            pickable: false,
             filled: true,
             stroked: true,
             getFillColor: (feature) =>
-              hovered?.kind === "plot" &&
-              hovered.regionKey === feature.properties.regionKey
-                ? [244, 213, 143, 145]
-                : [...feature.properties.color, 32],
-            getLineColor: (feature) => [...feature.properties.color, 225],
-            getLineWidth: (feature) =>
-              hovered?.kind === "plot" &&
-              hovered.regionKey === feature.properties.regionKey
-                ? 2.8
-                : 1.4,
+              feature.properties.roadClass === "primary"
+                ? [202, 183, 142, 205]
+                : [126, 145, 137, 185],
+            getLineColor: (feature) =>
+              feature.properties.roadClass === "primary"
+                ? [237, 215, 167, 225]
+                : [172, 190, 179, 205],
+            getLineWidth: 0.7,
             lineWidthUnits: "pixels",
-            lineWidthMinPixels: 1,
-            onHover: (info) => onHover(info.object?.properties),
+            lineWidthMinPixels: 0.4,
           }),
         ]
       : []),
     ...(labelMode === "building"
       ? [
-          new ScatterplotLayer({
+          new GeoJsonLayer({
             id: "building-slots",
-            data: buildingSlots,
-            getPosition: (d) => xy(d.center),
-            getFillColor: (d) => [...buildingColor(d.building_id), 225],
-            getLineColor: [8, 13, 13, 220],
-            getRadius: 2.5,
-            radiusUnits: "pixels",
-            radiusMinPixels: 1.5,
+            data: { type: "FeatureCollection", features: buildingSlots },
+            filled: true,
             stroked: true,
+            getFillColor: (feature) => [
+              ...buildingColor(feature.properties.building_id),
+              205,
+            ],
+            getLineColor: [8, 13, 13, 220],
+            getLineWidth: 0.8,
+            lineWidthUnits: "pixels",
             lineWidthMinPixels: 0.5,
           }),
         ]
       : []),
-    ...(labelMode === "nation"
+    ...(showLabels && labelMode === "nation"
       ? [
           new TextLayer({
             id: "nation-labels",
-            data: visibleNations,
+            data: formedNationLabels,
             getPosition: (d) => xy(polygonCenter(d.boundary)),
             getText: (d) => d.zh_cn_name,
             getColor: [227, 228, 210, 230],
@@ -625,11 +867,11 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
           }),
         ]
       : []),
-    ...(labelMode === "city"
+    ...(showLabels && labelMode === "city"
       ? [
           new TextLayer({
             id: "city-labels",
-            data: cityLabels,
+            data: formedCityLabels,
             getPosition: (d) => xy(polygonCenter(d.boundary)),
             getText: (d) => d.zh_cn_name,
             getColor: [238, 232, 208, 245],
@@ -642,44 +884,22 @@ function createLayers(layout, visibleNations, hovered, onHover, labelMode) {
           }),
         ]
       : []),
-    ...(labelMode === "region"
-      ? [
-          new TextLayer({
-            id: "region-labels",
-            data: regionLabels,
-            getPosition: (d) => xy(polygonCenter(d.boundary)),
-            getText: (d) => d.zh_cn_name,
-            getColor: [224, 226, 211, 235],
-            getSize: 10,
-            sizeUnits: "pixels",
-            fontWeight: 500,
-            outlineWidth: 3,
-            outlineColor: [5, 10, 10, 240],
-            ...FONT,
-          }),
-        ]
-      : []),
-    ...(labelMode === "plot"
-      ? [
-          new TextLayer({
-            id: "mobile-plot-labels",
-            data: plotLabels,
-            getPosition: (d) => xy(d.center),
-            getText: (d) => d.zh_cn_name,
-            getColor: [244, 221, 169, 240],
-            getSize: 10,
-            sizeUnits: "pixels",
-            fontWeight: 600,
-            outlineWidth: 3,
-            outlineColor: [5, 10, 10, 240],
-            ...FONT,
-          }),
-        ]
-      : []),
   ];
 }
 
-const Header = memo(function Header({ layout }) {
+const Header = memo(function Header({
+  layout,
+  viewMode,
+  switchView,
+  showMapLabels,
+  setShowMapLabels,
+  showTerrainLabels,
+  setShowTerrainLabels,
+  terrainColorized,
+  setTerrainColorized,
+  detailPanelOpen,
+  toggleDetailPanel,
+}) {
   const cities = layout.nations.reduce(
     (sum, nation) => sum + nation.cities.length,
     0,
@@ -689,9 +909,55 @@ const Header = memo(function Header({ layout }) {
       <div className="brand">
         <span className="brand-mark" />
         <div>
-          <p>TERRA LAYOUT / V9</p>
+          <p>TERRA LAYOUT / V{layout.schema_version}</p>
           <h1>Show Me Terra</h1>
         </div>
+      </div>
+      <div className="topbar-controls">
+        <div className="header-view-switch" role="group" aria-label="地图视图">
+          <button
+            className={viewMode === "map" ? "active" : ""}
+            onClick={() => switchView("map")}
+          >
+            二维地图
+          </button>
+          <button
+            className={viewMode === "terrain" ? "active" : ""}
+            onClick={() => switchView("terrain")}
+          >
+            三维地形
+          </button>
+        </div>
+        <label className="header-label-toggle">
+          <input
+            type="checkbox"
+            checked={viewMode === "map" ? showMapLabels : showTerrainLabels}
+            onChange={(event) =>
+              viewMode === "map"
+                ? setShowMapLabels(event.target.checked)
+                : setShowTerrainLabels(event.target.checked)
+            }
+          />
+          <span>{viewMode === "map" ? "显示文字" : "显示国家名称"}</span>
+        </label>
+        {viewMode === "terrain" && (
+          <label className="header-label-toggle">
+            <input
+              type="checkbox"
+              checked={terrainColorized}
+              onChange={(event) => setTerrainColorized(event.target.checked)}
+            />
+            <span>分层设色</span>
+          </label>
+        )}
+        {viewMode === "map" && (
+          <button
+            className={`nation-detail-trigger ${detailPanelOpen ? "active" : ""}`}
+            onClick={toggleDetailPanel}
+          >
+            国家详情
+          </button>
+        )}
       </div>
       <div className="world-meta">
         <span>
@@ -705,6 +971,62 @@ const Header = memo(function Header({ layout }) {
         </span>
       </div>
     </header>
+  );
+});
+
+const NationDetailPanel = memo(function NationDetailPanel({
+  layout,
+  selectedNationId,
+  onSelect,
+  onExit,
+  onClose,
+  detailState,
+}) {
+  const selectedNation = layout.nations.find(
+    (nation) => nation.id === selectedNationId,
+  );
+  return (
+    <aside className="nation-detail-panel panel">
+      <div className="nation-detail-heading">
+        <div>
+          <span className="eyebrow">NATION DETAIL</span>
+          <h2>{selectedNation?.zh_cn_name ?? "选择国家"}</h2>
+        </div>
+        <button className="icon-button" title="关闭" onClick={onClose}>×</button>
+      </div>
+      {selectedNation && (
+        <div className="nation-detail-status">
+          <span>{selectedNation.cities.length} 个城市</span>
+          <span>
+            {selectedNation.cities.reduce(
+              (total, city) => total + city.regions.length,
+              0,
+            )}{" "}
+            个 Region
+          </span>
+          {detailState.loading && <b>正在加载道路与建筑…</b>}
+          {detailState.data && <b>道路与建筑已加载</b>}
+          {detailState.error && <b className="error-text">加载失败</b>}
+          <button onClick={onExit}>退出详情</button>
+        </div>
+      )}
+      <div className="nation-detail-list">
+        {layout.nations.map((nation, index) => (
+          <button
+            key={nation.id}
+            className={nation.id === selectedNationId ? "active" : ""}
+            onClick={() => onSelect(nation)}
+          >
+            <i style={{ background: `rgb(${COLORS[index % COLORS.length].join(" ")})` }} />
+            <span>
+              <strong>{nation.zh_cn_name}</strong>
+              <small>{nation.id}</small>
+            </span>
+            <em>{nation.cities.length}</em>
+          </button>
+        ))}
+      </div>
+    </aside>
   );
 });
 
@@ -845,11 +1167,20 @@ const Explorer = memo(function Explorer({
 
 export default function App() {
   const { data: layout, heightmap, error } = useTerraData();
-  const [filter, setFilter] = useState("all");
-  const [query, setQuery] = useState("");
   const [hovered, setHovered] = useState(null);
   const [viewMode, setViewMode] = useState("map");
-  const [showTerrainLabels, setShowTerrainLabels] = useState(true);
+  const [showMapLabels, setShowMapLabels] = useState(true);
+  const [showTerrainLabels, setShowTerrainLabels] = useState(false);
+  const [terrainColorized, setTerrainColorized] = useState(false);
+  const [formationProgress, setFormationProgress] = useState(null);
+  const [formationPlaying, setFormationPlaying] = useState(false);
+  const [detailPanelOpen, setDetailPanelOpen] = useState(false);
+  const [selectedNationId, setSelectedNationId] = useState(null);
+  const [nationDetailState, setNationDetailState] = useState({
+    data: null,
+    loading: false,
+    error: null,
+  });
   const [initialViewState, setInitialViewState] = useState(HOME);
   const [labelMode, setLabelMode] = useState(() => getLabelMode(HOME.zoom));
   const liveView = useRef(HOME);
@@ -857,7 +1188,18 @@ export default function App() {
   const liveLabelMode = useRef(getLabelMode(HOME.zoom));
   const coordinatesRef = useRef(null);
   const coordinateFrame = useRef(0);
+  const formationFrame = useRef(0);
   const hoveredKey = useRef("");
+
+  const pauseFormation = useCallback(() => {
+    if (formationFrame.current) cancelAnimationFrame(formationFrame.current);
+    formationFrame.current = 0;
+    setFormationPlaying(false);
+  }, []);
+  const stopFormation = useCallback(() => {
+    pauseFormation();
+    setFormationProgress(null);
+  }, [pauseFormation]);
 
   const setMapView = useCallback((target, zoom) => {
     const next = {
@@ -882,6 +1224,7 @@ export default function App() {
   }, []);
   const switchView = useCallback((mode) => {
     if (mode === liveViewMode.current) return;
+    stopFormation();
     liveViewMode.current = mode;
     setViewMode(mode);
     const home = mode === "terrain" ? TERRAIN_HOME : HOME;
@@ -896,6 +1239,66 @@ export default function App() {
     setInitialViewState({ ...home, target: [...home.target] });
     if (coordinatesRef.current)
       coordinatesRef.current.textContent = "X 0 · Z 0";
+  }, [stopFormation]);
+  const playFormation = useCallback(() => {
+    pauseFormation();
+    if (liveViewMode.current !== "map") switchView("map");
+    const startProgress =
+      formationProgress === null || formationProgress >= 1
+        ? 0
+        : formationProgress;
+    if (formationProgress === null) {
+      setMapView(HOME.target, HOME.zoom);
+    }
+    setFormationProgress(startProgress);
+    setFormationPlaying(true);
+
+    const startedAt =
+      performance.now() - startProgress * FORMATION_REVEAL_DURATION;
+    let lastUpdate = 0;
+    const animate = (now) => {
+      const elapsed = now - startedAt;
+      if (
+        elapsed <= FORMATION_REVEAL_DURATION &&
+        (now - lastUpdate >= 50 || elapsed === 0)
+      ) {
+        lastUpdate = now;
+        setFormationProgress(
+          Math.min(1, elapsed / FORMATION_REVEAL_DURATION),
+        );
+      }
+      if (elapsed < FORMATION_REVEAL_DURATION) {
+        formationFrame.current = requestAnimationFrame(animate);
+      } else {
+        formationFrame.current = 0;
+        setFormationProgress(1);
+        setFormationPlaying(false);
+      }
+    };
+    formationFrame.current = requestAnimationFrame(animate);
+  }, [formationProgress, pauseFormation, setMapView, switchView]);
+  const scrubFormation = useCallback(
+    (event) => {
+      pauseFormation();
+      if (formationProgress === null) {
+        setMapView(HOME.target, HOME.zoom);
+      }
+      setFormationProgress(Number(event.target.value) / 1000);
+    },
+    [formationProgress, pauseFormation, setMapView],
+  );
+  const selectNation = useCallback(
+    (nation) => {
+      stopFormation();
+      setSelectedNationId(nation.id);
+      setMapView(xy(nation.center), -2.3);
+    },
+    [setMapView, stopFormation],
+  );
+  const exitNationDetail = useCallback(() => {
+    setSelectedNationId(null);
+    hoveredKey.current = "";
+    setHovered(null);
   }, []);
   const hoverItem = useCallback((item) => {
     const key = item
@@ -917,6 +1320,8 @@ export default function App() {
       if (nextMode !== liveLabelMode.current) {
         liveLabelMode.current = nextMode;
         setLabelMode(nextMode);
+        hoveredKey.current = "";
+        setHovered(null);
       }
     }
     if (coordinateFrame.current) return;
@@ -932,34 +1337,94 @@ export default function App() {
     () => () => {
       if (coordinateFrame.current)
         cancelAnimationFrame(coordinateFrame.current);
+      if (formationFrame.current)
+        cancelAnimationFrame(formationFrame.current);
     },
     [],
   );
+  useEffect(() => {
+    if (!layout || !selectedNationId) {
+      setNationDetailState({ data: null, loading: false, error: null });
+      return undefined;
+    }
+    const detailPath = layout.nation_detail_files?.[selectedNationId];
+    if (!detailPath) {
+      setNationDetailState({
+        data: null,
+        loading: false,
+        error: new Error(`缺少国家详情文件: ${selectedNationId}`),
+      });
+      return undefined;
+    }
 
-  const visibleNations = useMemo(
-    () =>
-      layout?.nations.filter(
-        (nation) =>
-          !(filter === "surface" && nation.underground) &&
-          !(filter === "underground" && !nation.underground) &&
-          (!query ||
-            [
-              nation.zh_cn_name,
-              nation.id,
-              ...nation.cities.flatMap((c) => [c.zh_cn_name, c.id]),
-            ]
-              .join(" ")
-              .toLowerCase()
-              .includes(query)),
-      ) ?? [],
-    [layout, filter, query],
-  );
+    const controller = new AbortController();
+    setNationDetailState({ data: null, loading: true, error: null });
+    fetch(versionedAsset(`data/${detailPath}`), { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok)
+          throw new Error(`${detailPath}: HTTP ${response.status}`);
+        return readPossiblyGzippedJson(response, detailPath);
+      })
+      .then((data) => {
+        if (
+          data.schema_version !== layout.schema_version ||
+          data.nation?.id !== selectedNationId
+        ) {
+          throw new Error(`国家详情数据不匹配: ${selectedNationId}`);
+        }
+        const nationDetail = {
+          schema_version: data.schema_version,
+          nation_id: data.nation.id,
+          regions: data.nation.cities.flatMap((city) =>
+            city.regions.map((region) => ({
+              id: region.id,
+              city_id: city.id,
+              slot_index: region.slot_index,
+              roads: region.region_layout.road_graph.edges,
+              building_slots: region.building_slots,
+            })),
+          ),
+        };
+        setNationDetailState({
+          data: nationDetail,
+          loading: false,
+          error: null,
+        });
+      })
+      .catch((error) => {
+        if (error.name !== "AbortError")
+          setNationDetailState({ data: null, loading: false, error });
+      });
+    return () => controller.abort();
+  }, [layout, selectedNationId]);
+
+  const visibleNations = layout?.nations ?? [];
   const layers = useMemo(
     () =>
       layout
-        ? createLayers(layout, visibleNations, hovered, hoverItem, labelMode)
+        ? createLayers(
+            layout,
+            visibleNations,
+            hovered,
+            hoverItem,
+            labelMode,
+            showMapLabels,
+            formationProgress,
+            nationDetailState.data,
+            selectedNationId,
+          )
         : [],
-    [layout, visibleNations, hovered, hoverItem, labelMode],
+    [
+      layout,
+      visibleNations,
+      hovered,
+      hoverItem,
+      labelMode,
+      showMapLabels,
+      formationProgress,
+      nationDetailState.data,
+      selectedNationId,
+    ],
   );
   const terrainMetrics = useMemo(
     () =>
@@ -972,6 +1437,12 @@ export default function App() {
     if (!layout || !heightmap || !terrainMetrics || viewMode !== "terrain")
       return [];
     const boundaryData = createTerrainBoundaries(layout);
+    const structures = createTerrainStructures(
+      layout,
+      nationDetailState.data,
+      terrainMetrics,
+      heightmap,
+    );
     return [
       new SimpleMeshLayer({
         id: "terrain-solid-base",
@@ -979,39 +1450,53 @@ export default function App() {
         mesh: createTerrainBaseMesh(layout.boundary, heightmap, terrainMetrics),
         _instanced: false,
         getPosition: [0, 0, 0],
-        getColor: [190, 193, 193, 255],
-        material: {
-          ambient: 0.72,
-          diffuse: 0.45,
-          shininess: 8,
-          specularColor: [255, 255, 255],
-        },
+        getColor: terrainColorized
+          ? [190, 193, 193, 255]
+          : [255, 255, 255, 255],
+        material: false,
         pickable: false,
       }),
       new TerrainLayer({
-        id: "terra-heightmap",
+        id: `terra-heightmap-${terrainColorized ? "color" : "plain"}`,
         operation: "terrain+draw",
         elevationData: versionedAsset("terrain/elevation.png"),
-        texture: versionedAsset("terrain/terrain-texture.png"),
+        texture: terrainColorized
+          ? versionedAsset("terrain/terrain-texture.png")
+          : WHITE_TERRAIN_TEXTURE,
         bounds: getTerrainBounds(layout.boundary),
         elevationDecoder: {
           rScaler: 256 * terrainMetrics.scale,
           gScaler: terrainMetrics.scale,
           bScaler: 0,
           offset:
-            TERRAIN_BASE_HEIGHT +
-            (Math.min(0, Math.floor(heightmap.statistics.minimum_y)) -
-              terrainMetrics.min) *
-              terrainMetrics.scale,
+            Math.min(0, Math.floor(heightmap.statistics.minimum_y)) *
+            terrainMetrics.scale,
         },
         meshMaxError: 16,
-        color: [210, 213, 213],
-        material: {
-          ambient: 0.68,
-          diffuse: 0.5,
-          shininess: 12,
-          specularColor: [255, 255, 255],
-        },
+        color: [255, 255, 255],
+        material: false,
+      }),
+      new SimpleMeshLayer({
+        id: "terrain-region-foundations",
+        data: structures.foundations,
+        mesh: UNIT_BOX_MESH,
+        getPosition: (item) => item.position,
+        getScale: (item) => item.scale,
+        getColor: (item) =>
+          terrainColorized ? item.color : [255, 255, 255, 255],
+        material: false,
+        pickable: false,
+      }),
+      new SimpleMeshLayer({
+        id: "terrain-region-buildings",
+        data: structures.buildings,
+        mesh: UNIT_BOX_MESH,
+        getPosition: (item) => item.position,
+        getScale: (item) => item.scale,
+        getColor: (item) =>
+          terrainColorized ? item.color : [255, 255, 255, 255],
+        material: false,
+        pickable: false,
       }),
       new GeoJsonLayer({
         id: "terrain-boundaries",
@@ -1060,7 +1545,15 @@ export default function App() {
         terrainDrawMode: "offset",
       }),
     ];
-  }, [heightmap, layout, showTerrainLabels, terrainMetrics, viewMode]);
+  }, [
+    heightmap,
+    layout,
+    nationDetailState.data,
+    showTerrainLabels,
+    terrainColorized,
+    terrainMetrics,
+    viewMode,
+  ]);
   const zoomBy = (delta) => {
     const current = liveView.current;
     const zoom = Array.isArray(current.zoom) ? current.zoom[0] : current.zoom;
@@ -1093,7 +1586,7 @@ export default function App() {
       </div>
     );
   return (
-    <div id="app">
+    <div id="app" className={detailPanelOpen ? "detail-open" : ""}>
       <div
         id="map"
         aria-label={viewMode === "terrain" ? "Terra 三维地形" : "Terra 二维地图"}
@@ -1111,29 +1604,71 @@ export default function App() {
           getCursor={GET_CURSOR}
         />
       </div>
-      <Header layout={layout} />
-      <div className="view-switch" role="group" aria-label="地图视图">
-        <button className={viewMode === "map" ? "active" : ""} onClick={() => switchView("map")}>二维地图</button>
-        <button className={viewMode === "terrain" ? "active" : ""} onClick={() => switchView("terrain")}>三维地形</button>
-      </div>
-      {viewMode === "terrain" && (
-        <label className="terrain-label-toggle">
-          <input
-            type="checkbox"
-            checked={showTerrainLabels}
-            onChange={(event) => setShowTerrainLabels(event.target.checked)}
-          />
-          <span>显示国家名称</span>
-        </label>
+      <Header
+        layout={layout}
+        viewMode={viewMode}
+        switchView={switchView}
+        showMapLabels={showMapLabels}
+        setShowMapLabels={setShowMapLabels}
+        showTerrainLabels={showTerrainLabels}
+        setShowTerrainLabels={setShowTerrainLabels}
+        terrainColorized={terrainColorized}
+        setTerrainColorized={setTerrainColorized}
+        detailPanelOpen={detailPanelOpen}
+        toggleDetailPanel={() => setDetailPanelOpen((open) => !open)}
+      />
+      {viewMode === "map" && detailPanelOpen && (
+        <NationDetailPanel
+          layout={layout}
+          selectedNationId={selectedNationId}
+          onSelect={selectNation}
+          onExit={exitNationDetail}
+          onClose={() => setDetailPanelOpen(false)}
+          detailState={nationDetailState}
+        />
       )}
       {viewMode === "map" && (
-        <Explorer
-          layout={layout}
-          filter={filter}
-          setFilter={setFilter}
-          query={query}
-          setQuery={setQuery}
-        />
+        <div className="map-options">
+          <div className="map-option-controls">
+            <button
+              className={formationPlaying ? "active" : ""}
+              onClick={formationPlaying ? pauseFormation : playFormation}
+            >
+              {formationPlaying
+                ? "暂停"
+                : formationProgress === null
+                  ? "演示形成"
+                  : formationProgress >= 1
+                    ? "重新播放"
+                    : "继续播放"}
+            </button>
+            {formationProgress !== null && (
+              <button onClick={stopFormation}>退出</button>
+            )}
+          </div>
+          <div className="formation-progress" aria-live="polite">
+            <span>
+              {formationProgress === null
+                ? "时间线"
+                : formationProgress < FORMATION_NATIONS_END
+                  ? "国家形成"
+                  : formationProgress < FORMATION_CITIES_END
+                    ? "城市形成"
+                    : "区域生长"}
+            </span>
+            <input
+              type="range"
+              min="0"
+              max="1000"
+              step="1"
+              value={(formationProgress ?? 0) * 1000}
+              aria-label="布局形成时间线"
+              onPointerDown={pauseFormation}
+              onChange={scrubFormation}
+            />
+            <small>{Math.round((formationProgress ?? 0) * 100)}%</small>
+          </div>
+        </div>
       )}
       <div className="map-tools">
         <button title="放大" onClick={() => zoomBy(0.6)}>

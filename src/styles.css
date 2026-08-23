@@ -60,11 +60,11 @@ body:after {
   top: 0;
   left: 0;
   right: 0;
-  height: 90px;
+  height: 62px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 34px;
+  padding: 0 24px;
   border-bottom: 1px solid var(--line);
   background: linear-gradient(
     180deg,
@@ -76,11 +76,11 @@ body:after {
 .brand {
   display: flex;
   align-items: center;
-  gap: 15px;
+  gap: 12px;
 }
 .brand-mark {
-  width: 30px;
-  height: 30px;
+  width: 22px;
+  height: 22px;
   border: 1px solid var(--accent);
   transform: rotate(45deg);
   position: relative;
@@ -93,36 +93,36 @@ body:after {
 }
 .brand-mark:before {
   width: 1px;
-  height: 38px;
-  left: 14px;
-  top: -5px;
+  height: 28px;
+  left: 10px;
+  top: -3px;
 }
 .brand-mark:after {
   height: 1px;
-  width: 38px;
-  left: -5px;
-  top: 14px;
+  width: 28px;
+  left: -3px;
+  top: 10px;
 }
 .brand p,
 .eyebrow {
   color: var(--accent);
   font:
-    500 9px/1.2 "DM Mono",
+    500 7px/1.2 "DM Mono",
     monospace;
   letter-spacing: 0.2em;
-  margin: 0 0 5px;
+  margin: 0 0 3px;
 }
 .brand h1 {
   margin: 0;
   text-transform: uppercase;
   font:
-    600 20px/1 "DM Mono",
+    600 16px/1 "DM Mono",
     monospace;
   letter-spacing: 0.08em;
 }
 .world-meta {
   display: flex;
-  gap: 34px;
+  gap: 24px;
   font:
     400 9px "DM Mono",
     monospace;
@@ -139,6 +139,67 @@ body:after {
   color: var(--ink);
   font-size: 12px;
   font-weight: 500;
+}
+.topbar-controls {
+  position: absolute;
+  left: 50%;
+  display: flex;
+  align-items: stretch;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  background: rgba(8, 13, 13, 0.72);
+}
+.header-view-switch {
+  display: flex;
+}
+.header-view-switch button,
+.header-label-toggle {
+  min-width: 70px;
+  padding: 7px 11px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+}
+.header-view-switch button {
+  cursor: pointer;
+}
+.header-view-switch button:hover,
+.header-view-switch button.active {
+  color: var(--ink);
+  background: rgba(225, 171, 82, 0.12);
+}
+.header-view-switch button.active {
+  color: #151716;
+  background: var(--accent);
+}
+.header-label-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-left: 1px solid var(--line);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.header-label-toggle input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.nation-detail-trigger {
+  padding: 7px 11px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+  cursor: pointer;
+}
+.nation-detail-trigger:hover,
+.nation-detail-trigger.active {
+  color: var(--accent);
+  background: rgba(225, 171, 82, 0.08);
 }
 .panel {
   background: var(--panel);
@@ -351,7 +412,7 @@ kbd {
 .view-switch {
   position: absolute;
   z-index: 7;
-  top: 106px;
+  top: 74px;
   left: 50%;
   display: flex;
   padding: 3px;
@@ -376,10 +437,190 @@ kbd {
   color: #151716;
   background: var(--accent);
 }
+.map-options {
+  position: absolute;
+  z-index: 7;
+  top: 74px;
+  left: 50%;
+  width: 300px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  background: rgba(8, 13, 13, 0.9);
+  color: var(--muted);
+  font-size: 10px;
+  backdrop-filter: blur(14px);
+}
+.nation-detail-panel {
+  position: absolute;
+  z-index: 8;
+  top: 74px;
+  right: 20px;
+  bottom: 48px;
+  width: 300px;
+  display: flex;
+  flex-direction: column;
+}
+.nation-detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.nation-detail-heading h2 {
+  margin: 4px 0 0;
+  font-size: 17px;
+  font-weight: 500;
+}
+.nation-detail-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 9px;
+}
+.nation-detail-status b {
+  width: 100%;
+  color: #8fc1a4;
+  font-weight: 500;
+}
+.nation-detail-status .error-text {
+  color: #d88975;
+}
+.nation-detail-status button {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: transparent;
+  font-size: 9px;
+  cursor: pointer;
+}
+.nation-detail-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+.nation-detail-list > button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 7px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 0;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.nation-detail-list > button:hover,
+.nation-detail-list > button.active {
+  color: var(--ink);
+  background: rgba(225, 171, 82, 0.08);
+}
+.nation-detail-list i {
+  width: 7px;
+  height: 22px;
+}
+.nation-detail-list span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.nation-detail-list strong {
+  font-size: 11px;
+  font-weight: 500;
+}
+.nation-detail-list small,
+.nation-detail-list em {
+  font: 8px "DM Mono", monospace;
+  font-style: normal;
+}
+.detail-open .map-tools {
+  right: 334px;
+}
+.map-option-controls {
+  display: flex;
+  align-items: center;
+}
+.map-option-controls label {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.map-option-controls button {
+  align-self: stretch;
+  padding: 8px 12px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+.map-option-controls button:first-child {
+  flex: 1;
+  border-left: 0;
+}
+.map-option-controls button:hover,
+.map-option-controls button.active {
+  color: var(--accent);
+  background: rgba(225, 171, 82, 0.08);
+}
+.formation-progress {
+  display: grid;
+  grid-template-columns: 52px 1fr 30px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--line);
+  font: 8px "DM Mono", monospace;
+  letter-spacing: 0.06em;
+}
+.formation-progress input[type="range"] {
+  width: 100%;
+  height: 14px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+}
+.formation-progress input[type="range"]::-webkit-slider-runnable-track {
+  height: 2px;
+  background: rgba(225, 171, 82, 0.28);
+}
+.formation-progress input[type="range"]::-webkit-slider-thumb {
+  width: 9px;
+  height: 14px;
+  margin-top: -6px;
+  appearance: none;
+  border: 1px solid var(--accent);
+  background: #111918;
+}
+.formation-progress input[type="range"]::-moz-range-track {
+  height: 2px;
+  background: rgba(225, 171, 82, 0.28);
+}
+.formation-progress input[type="range"]::-moz-range-thumb {
+  width: 9px;
+  height: 14px;
+  border: 1px solid var(--accent);
+  border-radius: 0;
+  background: #111918;
+}
+.formation-progress small {
+  text-align: right;
+  font: inherit;
+}
 .terrain-label-toggle {
   position: absolute;
   z-index: 7;
-  top: 151px;
+  top: 119px;
   left: 50%;
   display: flex;
   align-items: center;
@@ -393,6 +634,7 @@ kbd {
   cursor: pointer;
   backdrop-filter: blur(14px);
 }
+.map-option-controls input[type="checkbox"],
 .terrain-label-toggle input {
   width: 13px;
   height: 13px;
@@ -443,7 +685,7 @@ kbd {
   position: absolute;
   z-index: 6;
   right: 20px;
-  top: 110px;
+  top: 74px;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--line);
@@ -556,11 +798,23 @@ kbd {
 }
 @media (max-width: 760px) {
   .topbar {
-    height: 76px;
-    padding: 0 18px;
+    height: 56px;
+    padding: 0 12px;
   }
-  .world-meta span:not(:first-child) {
+  .world-meta {
     display: none;
+  }
+  .topbar-controls {
+    position: static;
+    margin-left: auto;
+    transform: none;
+  }
+  .header-view-switch button,
+  .header-label-toggle,
+  .nation-detail-trigger {
+    min-width: auto;
+    padding: 6px 8px;
+    font-size: 8px;
   }
   .explorer {
     top: 88px;
@@ -570,10 +824,19 @@ kbd {
   }
   .map-tools {
     right: 10px;
-    top: 88px;
+    top: 66px;
   }
-  .view-switch {
-    top: 84px;
+  .map-options {
+    top: 66px;
+  }
+  .nation-detail-panel {
+    top: 66px;
+    right: 10px;
+    bottom: 42px;
+    width: min(300px, calc(100vw - 20px));
+  }
+  .detail-open .map-tools {
+    right: 10px;
   }
   .status-help {
     display: none;

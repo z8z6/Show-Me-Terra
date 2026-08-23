@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "data:sync": "node scripts/sync-terra-layout-v14.mjs",
     "terrain:generate": "node scripts/generate-terrain-assets.mjs"
   },
   "dependencies": {
