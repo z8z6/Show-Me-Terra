@@ -5,7 +5,7 @@ import zlib from "node:zlib";
 const [sourceValue, targetValue] = process.argv.slice(2);
 if (!sourceValue || !targetValue) {
   throw new Error(
-    "用法: node scripts/sync-terra-layout-v14.mjs <upstream-terra-layout-directory> <target-data-directory>",
+    "用法: node scripts/sync-terra-layout-v16.mjs <upstream-terra-layout-directory> <target-data-directory>",
   );
 }
 
@@ -16,14 +16,15 @@ const sourceNationDirectory = path.join(sourceDirectory, "nations");
 const targetNationDirectory = path.join(targetDirectory, "terra-nations");
 
 if (!fs.existsSync(sourceIndexPath) || !fs.existsSync(sourceNationDirectory)) {
-  throw new Error(`找不到 Terra Layout v14 拆分资源: ${sourceDirectory}`);
+  throw new Error(`找不到 Terra Layout v16 拆分资源: ${sourceDirectory}`);
 }
 
 const readGzipJson = (filename) =>
   JSON.parse(zlib.gunzipSync(fs.readFileSync(filename)));
+const requiredMobileLayers = ["power", "support", "life", "surface"];
 const index = readGzipJson(sourceIndexPath);
-if (index.schema_version !== 14 || !Array.isArray(index.nation_ids)) {
-  throw new Error(`需要 Terra Layout v14，实际为 v${index.schema_version}`);
+if (index.schema_version !== 16 || !Array.isArray(index.nation_ids)) {
+  throw new Error(`需要 Terra Layout v16，实际为 v${index.schema_version}`);
 }
 
 const nationFiles = index.nation_ids.map((nationId) => ({
@@ -41,8 +42,42 @@ fs.mkdirSync(targetNationDirectory, { recursive: true });
 const nationDetailFiles = {};
 const nations = nationFiles.map(({ nationId, sourcePath }) => {
   const detail = readGzipJson(sourcePath);
-  if (detail.schema_version !== 14 || detail.nation?.id !== nationId) {
+  if (detail.schema_version !== 16 || detail.nation?.id !== nationId) {
     throw new Error(`国家详情数据不匹配: ${nationId}`);
+  }
+  for (const city of detail.nation.cities) {
+    for (const region of city.regions) {
+      const layerNames = region.region_layout?.mobile_layers?.map(
+        (layer) => layer.layer,
+      );
+      if (
+        !layerNames ||
+        layerNames.length !== requiredMobileLayers.length ||
+        !requiredMobileLayers.every((name) => layerNames.includes(name))
+      ) {
+        throw new Error(`Region 四层布局不完整: ${city.id}/${region.id}`);
+      }
+      const expectedStairs = region.region_layout.mobile_layers[0].stair_chunks;
+      if (!Array.isArray(expectedStairs) || expectedStairs.length < 4) {
+        throw new Error(`Region 楼梯数量不足: ${city.id}/${region.id}`);
+      }
+      const expectedCoordinates = expectedStairs
+        .map(({ chunk_x, chunk_z }) => `${chunk_x}:${chunk_z}`)
+        .sort()
+        .join(",");
+      for (const layer of region.region_layout.mobile_layers) {
+        const coordinates = layer.stair_chunks
+          ?.map(({ chunk_x, chunk_z }) => `${chunk_x}:${chunk_z}`)
+          .sort()
+          .join(",");
+        if (
+          coordinates !== expectedCoordinates ||
+          !Array.isArray(layer.road_junctions)
+        ) {
+          throw new Error(`Region v16 分层数据无效: ${city.id}/${region.id}`);
+        }
+      }
+    }
   }
 
   const filename = `${nationId}.json.gz`;
@@ -77,6 +112,6 @@ const detailBytes = fs
     0,
   );
 console.log(
-  `Terra Layout v14 synced: overview ${(fs.statSync(overviewPath).size / 1048576).toFixed(1)} MiB, ` +
+  `Terra Layout v16 synced: overview ${(fs.statSync(overviewPath).size / 1048576).toFixed(1)} MiB, ` +
     `${nations.length} gzip nation files ${(detailBytes / 1048576).toFixed(1)} MiB`,
 );

@@ -61,12 +61,53 @@ async function readPossiblyGzippedJson(response, path) {
     .pipeThrough(new DecompressionStream("gzip"));
   return new Response(stream).json();
 }
+const normalizeNationDetail = (data) => ({
+  schema_version: data.schema_version,
+  nation_id: data.nation.id,
+  regions: data.nation.cities.flatMap((city) =>
+    city.regions.map((region) => {
+      const mobileLayers = region.region_layout.mobile_layers;
+      const surface = mobileLayers.find((layer) => layer.layer === "surface");
+      if (!surface) throw new Error(`Region 缺少 surface 层: ${region.id}`);
+      return {
+        id: region.id,
+        city_id: city.id,
+        slot_index: region.slot_index,
+        mobile_layers: mobileLayers,
+        roads: surface.road_graph.edges,
+        building_slots: region.building_slots,
+      };
+    }),
+  ),
+});
+async function fetchNationDetail(layout, nationId, signal) {
+  const detailPath = layout.nation_detail_files?.[nationId];
+  if (!detailPath) throw new Error(`缺少国家详情文件: ${nationId}`);
+  const response = await fetch(versionedAsset(`data/${detailPath}`), { signal });
+  if (!response.ok) throw new Error(`${detailPath}: HTTP ${response.status}`);
+  const data = await readPossiblyGzippedJson(response, detailPath);
+  if (
+    data.schema_version !== layout.schema_version ||
+    data.nation?.id !== nationId
+  )
+    throw new Error(`国家详情数据不匹配: ${nationId}`);
+  return normalizeNationDetail(data);
+}
 const HOME = { target: [0, 0, 0], zoom: -6.35, minZoom: -8, maxZoom: 2 };
 const TERRAIN_HOME = {
   target: [0, 0, 3000],
   zoom: -6.35,
   rotationX: 55,
   rotationOrbit: 25,
+  minZoom: -8,
+  maxZoom: 2,
+};
+const SIDE_LAYER_SPACING = 72;
+const SIDE_HOME = {
+  target: [0, 0, SIDE_LAYER_SPACING * 1.5],
+  zoom: -1.5,
+  rotationX: 72,
+  rotationOrbit: 0,
   minZoom: -8,
   maxZoom: 2,
 };
@@ -80,6 +121,12 @@ const TERRAIN_MAX_SCALE = 64;
 const TERRAIN_BOUNDARY_LIFT = 36;
 const TERRAIN_BOUNDARY_STEP = 512;
 const TERRAIN_LABEL_LIFT = 1200;
+const MOBILE_LAYERS = [
+  { id: "power", label: "动力" },
+  { id: "support", label: "支持" },
+  { id: "life", label: "生活" },
+  { id: "surface", label: "地表" },
+];
 const FORMATION_REVEAL_DURATION = 14000;
 const FORMATION_NATIONS_END = 0.2;
 const FORMATION_CITIES_END = 0.45;
@@ -97,7 +144,7 @@ const CONTROLLER = {
   dragPan: true,
   dragRotate: false,
   scrollZoom: { smooth: false, speed: 0.006 },
-  doubleClickZoom: true,
+  doubleClickZoom: false,
   touchZoom: true,
   touchRotate: false,
 };
@@ -122,12 +169,269 @@ const chunkAreaCorners = ({
     { x: minX, z: maxZ },
   ];
 };
+const narrowRoadCorners = (
+  { min_chunk_x, min_chunk_z, width_chunks, length_chunks },
+  ratio = 0.36,
+) => {
+  let minX = min_chunk_x * 16;
+  let minZ = min_chunk_z * 16;
+  let maxX = minX + width_chunks * 16;
+  let maxZ = minZ + length_chunks * 16;
+  const width = maxX - minX;
+  const depth = maxZ - minZ;
+  if (width > depth) {
+    const inset = (depth * (1 - ratio)) / 2;
+    minZ += inset;
+    maxZ -= inset;
+  } else if (depth > width) {
+    const inset = (width * (1 - ratio)) / 2;
+    minX += inset;
+    maxX -= inset;
+  } else {
+    const insetX = (width * (1 - ratio)) / 2;
+    const insetZ = (depth * (1 - ratio)) / 2;
+    minX += insetX;
+    maxX -= insetX;
+    minZ += insetZ;
+    maxZ -= insetZ;
+  }
+  return [
+    { x: minX, z: minZ },
+    { x: maxX, z: minZ },
+    { x: maxX, z: maxZ },
+    { x: minX, z: maxZ },
+  ];
+};
+const ROAD_NODE_CACHE = new WeakMap();
+const roadNodes = (roadGraph) => {
+  let nodes = ROAD_NODE_CACHE.get(roadGraph);
+  if (!nodes) {
+    nodes = new Map(roadGraph.nodes.map((node) => [node.id, node]));
+    ROAD_NODE_CACHE.set(roadGraph, nodes);
+  }
+  return nodes;
+};
+const roadEdgeCorners = (edge, roadGraph, ratio = 0.36) => {
+  const nodes = roadNodes(roadGraph);
+  const from = nodes.get(edge.from_node_id)?.point;
+  const to = nodes.get(edge.to_node_id)?.point;
+  if (!from || !to) return narrowRoadCorners(edge.chunk_area, ratio);
+  const fromX = (from.chunk_x + 0.5) * 16;
+  const fromZ = (from.chunk_z + 0.5) * 16;
+  const toX = (to.chunk_x + 0.5) * 16;
+  const toZ = (to.chunk_z + 0.5) * 16;
+  const halfWidth =
+    Math.min(edge.chunk_area.width_chunks, edge.chunk_area.length_chunks) *
+    8 *
+    ratio;
+  const horizontal = Math.abs(toX - fromX) >= Math.abs(toZ - fromZ);
+  const minX = horizontal ? Math.min(fromX, toX) : fromX - halfWidth;
+  const maxX = horizontal ? Math.max(fromX, toX) : fromX + halfWidth;
+  const minZ = horizontal ? fromZ - halfWidth : Math.min(fromZ, toZ);
+  const maxZ = horizontal ? fromZ + halfWidth : Math.max(fromZ, toZ);
+  return [
+    { x: minX, z: minZ },
+    { x: maxX, z: minZ },
+    { x: maxX, z: maxZ },
+    { x: minX, z: maxZ },
+  ];
+};
+const roadJunctionParts = (chunkX, chunkZ, halfWidth, connectionMask) => {
+  const centerX = (chunkX + 0.5) * 16;
+  const centerZ = (chunkZ + 0.5) * 16;
+  const minX = chunkX * 16;
+  const minZ = chunkZ * 16;
+  const maxX = minX + 16;
+  const maxZ = minZ + 16;
+  const rectangle = (left, top, right, bottom) => [
+    { x: left, z: top },
+    { x: right, z: top },
+    { x: right, z: bottom },
+    { x: left, z: bottom },
+  ];
+  const parts = [
+    rectangle(
+      centerX - halfWidth,
+      centerZ - halfWidth,
+      centerX + halfWidth,
+      centerZ + halfWidth,
+    ),
+  ];
+  if (connectionMask & 1)
+    parts.push(
+      rectangle(centerX - halfWidth, minZ, centerX + halfWidth, centerZ),
+    );
+  if (connectionMask & 2)
+    parts.push(
+      rectangle(centerX, centerZ - halfWidth, maxX, centerZ + halfWidth),
+    );
+  if (connectionMask & 4)
+    parts.push(
+      rectangle(centerX - halfWidth, centerZ, centerX + halfWidth, maxZ),
+    );
+  if (connectionMask & 8)
+    parts.push(
+      rectangle(minX, centerZ - halfWidth, centerX, centerZ + halfWidth),
+    );
+  return parts;
+};
+const roadJunctionPatches = (layer, ratio = 0.36) => {
+  const roadGraph = layer.road_graph;
+  const nodes = roadNodes(roadGraph);
+  const incidents = new Map();
+  roadGraph.edges.forEach((edge) => {
+    for (const [nodeId, neighborId] of [
+      [edge.from_node_id, edge.to_node_id],
+      [edge.to_node_id, edge.from_node_id],
+    ]) {
+      const connected = incidents.get(nodeId) ?? [];
+      connected.push({ edge, neighborId });
+      incidents.set(nodeId, connected);
+    }
+  });
+  if (Array.isArray(layer.road_junctions)) {
+    const nodeByChunk = new Map(
+      roadGraph.nodes.map((node) => [
+        `${node.point.chunk_x}:${node.point.chunk_z}`,
+        node.id,
+      ]),
+    );
+    return layer.road_junctions.map((junction) => {
+      const nodeId = nodeByChunk.get(`${junction.chunk_x}:${junction.chunk_z}`);
+      const connected = incidents.get(nodeId) ?? [];
+      const widestEdge = Math.max(
+        ...connected.map(({ edge }) => edge.width_chunks ?? 1),
+        1,
+      );
+      const halfWidth = widestEdge * 8 * ratio;
+      return {
+        nodeId: nodeId ?? `${junction.chunk_x}-${junction.chunk_z}`,
+        type: junction.type,
+        rotation: junction.rotation,
+        connectionMask: junction.connection_mask,
+        roadClass: connected.some(({ edge }) => edge.road_class === "primary")
+          ? "primary"
+          : "service",
+        parts: roadJunctionParts(
+          junction.chunk_x,
+          junction.chunk_z,
+          halfWidth,
+          junction.connection_mask,
+        ),
+      };
+    });
+  }
+  return roadGraph.nodes.flatMap((node) => {
+    const connected = incidents.get(node.id) ?? [];
+    const directions = new Set();
+    connected.forEach(({ neighborId }) => {
+      const neighbor = nodes.get(neighborId)?.point;
+      if (!neighbor) return;
+      const dx = neighbor.chunk_x - node.point.chunk_x;
+      const dz = neighbor.chunk_z - node.point.chunk_z;
+      directions.add(
+        Math.abs(dx) >= Math.abs(dz)
+          ? dx < 0
+            ? "west"
+            : "east"
+          : dz < 0
+            ? "north"
+            : "south",
+      );
+    });
+    const turns =
+      (directions.has("west") || directions.has("east")) &&
+      (directions.has("north") || directions.has("south"));
+    if (!turns) return [];
+    const widestEdge = Math.max(
+      ...connected.map(({ edge }) =>
+        Math.min(edge.chunk_area.width_chunks, edge.chunk_area.length_chunks),
+      ),
+      1,
+    );
+    const halfWidth = widestEdge * 8 * ratio;
+    const centerX = (node.point.chunk_x + 0.5) * 16;
+    const centerZ = (node.point.chunk_z + 0.5) * 16;
+    return [
+      {
+        nodeId: node.id,
+        roadClass: connected.some(({ edge }) => edge.road_class === "primary")
+          ? "primary"
+          : "service",
+        parts: [[
+          { x: centerX - halfWidth, z: centerZ - halfWidth },
+          { x: centerX + halfWidth, z: centerZ - halfWidth },
+          { x: centerX + halfWidth, z: centerZ + halfWidth },
+          { x: centerX - halfWidth, z: centerZ + halfWidth },
+        ]],
+      },
+    ];
+  });
+};
+const stairChunkArea = ({ chunk_x, chunk_z }) => ({
+  min_chunk_x: chunk_x,
+  min_chunk_z: chunk_z,
+  width_chunks: 1,
+  length_chunks: 1,
+});
+const stairPattern = ({ chunk_x, chunk_z }) => {
+  const minX = chunk_x * 16;
+  const minY = -(chunk_z * 16);
+  return [
+    [minX + 2, minY - 3],
+    [minX + 6, minY - 3],
+    [minX + 6, minY - 7],
+    [minX + 10, minY - 7],
+    [minX + 10, minY - 11],
+    [minX + 14, minY - 11],
+    [minX + 14, minY - 14],
+  ];
+};
 const number = (value) => Math.round(value).toLocaleString("zh-CN");
+const pointInBoundary = (target, boundary) => {
+  const x = target[0];
+  const z = -target[1];
+  let inside = false;
+  for (let index = 0, previous = boundary.length - 1; index < boundary.length; previous = index++) {
+    const a = boundary[index];
+    const b = boundary[previous];
+    if (
+      (a.z > z) !== (b.z > z) &&
+      x < ((b.x - a.x) * (z - a.z)) / (b.z - a.z) + a.x
+    )
+      inside = !inside;
+  }
+  return inside;
+};
+const nationAtTarget = (layout, target) =>
+  layout?.nations.find((nation) => pointInBoundary(target, nation.boundary))
+    ?.id ?? null;
 const buildingColor = (id) => {
   let hash = 0;
   for (let index = 0; index < id.length; index++)
     hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
-  return COLORS[hash % COLORS.length];
+  const hue = hash % 360;
+  const saturation = 0.5 + ((hash >>> 9) % 18) / 100;
+  const lightness = 0.52 + ((hash >>> 17) % 12) / 100;
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+  const section = hue / 60;
+  const second = chroma * (1 - Math.abs((section % 2) - 1));
+  const [red, green, blue] =
+    section < 1
+      ? [chroma, second, 0]
+      : section < 2
+        ? [second, chroma, 0]
+        : section < 3
+          ? [0, chroma, second]
+          : section < 4
+            ? [0, second, chroma]
+            : section < 5
+              ? [second, 0, chroma]
+              : [chroma, 0, second];
+  const match = lightness - chroma / 2;
+  return [red, green, blue].map((channel) =>
+    Math.round((channel + match) * 255),
+  );
 };
 const getLabelMode = (zoom) =>
   zoom >= BUILDING_ZOOM
@@ -143,6 +447,8 @@ const POLYGON_CENTER_CACHE = new WeakMap();
 const MAP_DATA_CACHE = new WeakMap();
 const BUILDING_DATA_CACHE = new WeakMap();
 const REGION_ROAD_DATA_CACHE = new WeakMap();
+const STAIR_DATA_CACHE = new WeakMap();
+const SIDE_STRUCTURE_CACHE = new WeakMap();
 const UNIT_BOX_MESH = {
   attributes: {
     POSITION: {
@@ -429,6 +735,131 @@ function createTerrainStructures(layout, nationDetail, metrics, heightmap) {
   return { foundations, buildings };
 }
 
+function createSideStructures(nationDetail, target) {
+  if (!nationDetail) return { blocks: [], roads: [], stairs: [] };
+  const blockX = target[0] / 16;
+  const blockZ = -target[1] / 16;
+  const contains = (area) =>
+    blockX >= area.min_chunk_x &&
+    blockX <= area.min_chunk_x + area.width_chunks &&
+    blockZ >= area.min_chunk_z &&
+    blockZ <= area.min_chunk_z + area.length_chunks;
+  const distance = (region) => {
+    const area = region.mobile_layers[0].chunk_area;
+    const dx = blockX - (area.min_chunk_x + area.width_chunks / 2);
+    const dz = blockZ - (area.min_chunk_z + area.length_chunks / 2);
+    return dx * dx + dz * dz;
+  };
+  const selectedRegion =
+    nationDetail.regions.find((region) =>
+      contains(region.mobile_layers[0].chunk_area),
+    ) ?? nationDetail.regions.reduce((best, region) =>
+      !best || distance(region) < distance(best) ? region : best,
+    null);
+  if (!selectedRegion) return { blocks: [], roads: [], stairs: [] };
+  const cacheKey = `${selectedRegion.city_id}:${selectedRegion.slot_index}`;
+  const detailCache = SIDE_STRUCTURE_CACHE.get(nationDetail) ?? new Map();
+  const cached = detailCache.get(cacheKey);
+  if (cached) return cached;
+  const makeBox = (area, elevation, height, color) => {
+    const width = area.width_chunks * 16;
+    const depth = area.length_chunks * 16;
+    return {
+      position: [
+        area.min_chunk_x * 16 + width / 2,
+        -(area.min_chunk_z * 16 + depth / 2),
+        elevation + height / 2,
+      ],
+      scale: [width, depth, height],
+      color,
+    };
+  };
+  const makeRoadBox = (area, elevation, height, color, cornersOverride) => {
+    const corners = cornersOverride ?? narrowRoadCorners(area);
+    const minX = Math.min(...corners.map((point) => point.x));
+    const maxX = Math.max(...corners.map((point) => point.x));
+    const minZ = Math.min(...corners.map((point) => point.z));
+    const maxZ = Math.max(...corners.map((point) => point.z));
+    return {
+      position: [
+        (minX + maxX) / 2,
+        -(minZ + maxZ) / 2,
+        elevation + height / 2,
+      ],
+      scale: [maxX - minX, maxZ - minZ, height],
+      color,
+    };
+  };
+  const makeStairColumn = (stair) => {
+    const height = SIDE_LAYER_SPACING * (MOBILE_LAYERS.length - 1) + 15;
+    return {
+      position: [
+        stair.chunk_x * 16 + 8,
+        -(stair.chunk_z * 16 + 8),
+        height / 2,
+      ],
+      scale: [8, 8, height],
+      color: [248, 203, 111, 255],
+    };
+  };
+  const blocks = [];
+  const roads = [];
+  const stairs = [];
+  [selectedRegion].forEach((region) => {
+    region.mobile_layers.forEach((layer) => {
+      const elevation =
+        MOBILE_LAYERS.findIndex((item) => item.id === layer.layer) *
+        SIDE_LAYER_SPACING;
+      const buildingAreas =
+        layer.layer === "surface"
+          ? region.building_slots.map((slot) => ({
+              area: slot.chunk_area,
+              buildingId: slot.building_id,
+            }))
+          : layer.parcels.map((parcel) => ({
+              area: parcel.buildable_area ?? parcel.area,
+              buildingId: layer.building_id,
+            }));
+      buildingAreas.forEach(({ area, buildingId }) =>
+        blocks.push(
+          makeBox(area, elevation, 12, [...buildingColor(buildingId), 220]),
+        ),
+      );
+      layer.road_graph.edges.forEach((road) =>
+        roads.push(
+          makeRoadBox(
+            road.chunk_area,
+            elevation + 12,
+            3,
+            [211, 205, 183, 235],
+            roadEdgeCorners(road, layer.road_graph),
+          ),
+        ),
+      );
+      roadJunctionPatches(layer).forEach((junction) =>
+        junction.parts.forEach((part) =>
+          roads.push(
+            makeRoadBox(
+              layer.chunk_area,
+              elevation + 12,
+              3,
+              [211, 205, 183, 235],
+              part,
+            ),
+          ),
+        ),
+      );
+    });
+    region.mobile_layers[0].stair_chunks.forEach((stair) =>
+      stairs.push(makeStairColumn(stair)),
+    );
+  });
+  const structures = { blocks, roads, stairs };
+  detailCache.set(cacheKey, structures);
+  SIDE_STRUCTURE_CACHE.set(nationDetail, detailCache);
+  return structures;
+}
+
 function useTerraData() {
   const [state, setState] = useState({ data: null, heightmap: null, error: null });
   useEffect(() => {
@@ -445,8 +876,8 @@ function useTerraData() {
       loadJson("data/heightmap.json"),
     ])
       .then(([data, heightmap]) => {
-        if (data.schema_version !== 14)
-          throw new Error(`需要 Terra Layout v14，实际为 v${data.schema_version}`);
+        if (data.schema_version !== 16)
+          throw new Error(`需要 Terra Layout v16，实际为 v${data.schema_version}`);
         setState({ data, heightmap, error: null });
       })
       .catch((error) => {
@@ -463,11 +894,12 @@ function createLayers(
   visibleNations,
   hovered,
   onHover,
+  onRegionDoubleClick,
   labelMode,
   showLabels,
   formationProgress,
   nationDetail,
-  selectedNationId,
+  selectedMobileLayer,
 ) {
   let mapData = MAP_DATA_CACHE.get(visibleNations);
   if (!mapData) {
@@ -478,6 +910,7 @@ function createLayers(
     properties: {
       ...nation,
       kind: "nation",
+      nationId: nation.id,
       color: color(nation),
       cityCount: nation.cities.length,
       cities: undefined,
@@ -537,9 +970,7 @@ function createLayers(
         },
         geometry: {
           type: "Polygon",
-          coordinates: [
-            ring(road.block_area?.corners ?? chunkAreaCorners(road.chunk_area)),
-          ],
+          coordinates: [ring(narrowRoadCorners(road.chunk_area, 0.42))],
         },
       })),
     ),
@@ -608,10 +1039,14 @@ function createLayers(
     (labelMode === "plot" || labelMode === "building");
   let regionRoads = [];
   if (showRegionRoads) {
-    regionRoads = REGION_ROAD_DATA_CACHE.get(nationDetail);
+    const cachedRoadLayers = REGION_ROAD_DATA_CACHE.get(nationDetail);
+    regionRoads = cachedRoadLayers?.get(selectedMobileLayer);
     if (!regionRoads) {
-      regionRoads = nationDetail.regions.flatMap((region) =>
-        region.roads.map((road) => ({
+      regionRoads = nationDetail.regions.flatMap((region) => {
+        const layer = region.mobile_layers.find(
+          (item) => item.layer === selectedMobileLayer,
+        );
+        const edges = layer.road_graph.edges.map((road) => ({
           type: "Feature",
           properties: {
             kind: "region-road",
@@ -622,19 +1057,53 @@ function createLayers(
           },
           geometry: {
             type: "Polygon",
-            coordinates: [ring(chunkAreaCorners(road.chunk_area))],
+            coordinates: [ring(roadEdgeCorners(road, layer.road_graph))],
           },
-        })),
-      );
-      REGION_ROAD_DATA_CACHE.set(nationDetail, regionRoads);
+        }));
+        const junctions = roadJunctionPatches(layer).map(
+          (junction) => ({
+            type: "Feature",
+            properties: {
+              kind: "region-road-junction",
+              cityId: region.city_id,
+              regionId: region.id,
+              roadId: `junction-${junction.nodeId}`,
+              roadClass: junction.roadClass,
+              roadShape: junction.type,
+              rotation: junction.rotation,
+              connectionMask: junction.connectionMask,
+            },
+            geometry: {
+              type: "MultiPolygon",
+              coordinates: junction.parts.map((part) => [ring(part)]),
+            },
+          }),
+        );
+        return [...edges, ...junctions];
+      });
+      const roadLayers = cachedRoadLayers ?? new Map();
+      roadLayers.set(selectedMobileLayer, regionRoads);
+      REGION_ROAD_DATA_CACHE.set(nationDetail, roadLayers);
     }
   }
   let buildingSlots = [];
   if (nationDetail && labelMode === "building") {
-    buildingSlots = BUILDING_DATA_CACHE.get(nationDetail);
+    const cachedBuildingLayers = BUILDING_DATA_CACHE.get(nationDetail);
+    buildingSlots = cachedBuildingLayers?.get(selectedMobileLayer);
     if (!buildingSlots) {
-      buildingSlots = nationDetail.regions.flatMap((region) =>
-        region.building_slots.map((slot) => ({
+      buildingSlots = nationDetail.regions.flatMap((region) => {
+        const layer = region.mobile_layers.find(
+          (item) => item.layer === selectedMobileLayer,
+        );
+        const parcels =
+          selectedMobileLayer === "surface"
+            ? region.building_slots
+            : layer.parcels.map((parcel) => ({
+                ...parcel,
+                building_id: layer.building_id,
+                chunk_area: parcel.buildable_area ?? parcel.area,
+              }));
+        return parcels.map((slot) => ({
           type: "Feature",
           properties: {
             ...slot,
@@ -645,9 +1114,27 @@ function createLayers(
             type: "Polygon",
             coordinates: [ring(chunkAreaCorners(slot.chunk_area))],
           },
-        })),
-      );
-      BUILDING_DATA_CACHE.set(nationDetail, buildingSlots);
+        }));
+      });
+      const buildingLayers = cachedBuildingLayers ?? new Map();
+      buildingLayers.set(selectedMobileLayer, buildingSlots);
+      BUILDING_DATA_CACHE.set(nationDetail, buildingLayers);
+    }
+  }
+  let stairChunks = [];
+  if (showRegionRoads) {
+    const cachedStairLayers = STAIR_DATA_CACHE.get(nationDetail);
+    stairChunks = cachedStairLayers?.get(selectedMobileLayer);
+    if (!stairChunks) {
+      stairChunks = nationDetail.regions.flatMap((region) => {
+        const layer = region.mobile_layers.find(
+          (item) => item.layer === selectedMobileLayer,
+        );
+        return layer.stair_chunks.map((stair) => ({ region, stair }));
+      });
+      const stairLayers = cachedStairLayers ?? new Map();
+      stairLayers.set(selectedMobileLayer, stairChunks);
+      STAIR_DATA_CACHE.set(nationDetail, stairLayers);
     }
   }
 
@@ -742,9 +1229,7 @@ function createLayers(
         ...f.properties.color,
         hovered?.kind === "nation" && hovered.id === f.properties.id
           ? 105
-          : selectedNationId && selectedNationId !== f.properties.id
-            ? 18
-            : 47,
+          : 47,
       ],
       getLineColor: (f) =>
         f.properties.underground
@@ -779,23 +1264,38 @@ function createLayers(
       id: "city-regions",
       visible: showRegions,
       data: { type: "FeatureCollection", features: formedRegions },
-      pickable: labelMode === "region" || labelMode === "plot",
+      pickable:
+        labelMode === "region" ||
+        labelMode === "plot" ||
+        labelMode === "building",
       filled: true,
       stroked: true,
       getFillColor: (f) =>
+        labelMode !== "building" &&
         hovered?.kind === "region" &&
         hovered.regionKey === f.properties.regionKey
           ? [244, 213, 143, 125]
           : [12, 20, 19, 45],
       getLineColor: (f) => [...f.properties.color, 185],
       getLineWidth: (f) =>
+        labelMode !== "building" &&
         hovered?.kind === "region" &&
         hovered.regionKey === f.properties.regionKey
           ? 2.2
           : 0.8,
       lineWidthUnits: "pixels",
       lineWidthMinPixels: 1,
-      onHover: (info) => onHover(info.object?.properties),
+      onHover:
+        labelMode === "building"
+          ? undefined
+          : (info) => onHover(info.object?.properties),
+      onClick: (info, event) => {
+        if (
+          info.object &&
+          (event.tapCount === 2 || event.srcEvent?.detail === 2)
+        )
+          onRegionDoubleClick(info.object.properties);
+      },
     }),
     ...(showPlots
       ? [
@@ -829,6 +1329,59 @@ function createLayers(
             getLineWidth: 0.7,
             lineWidthUnits: "pixels",
             lineWidthMinPixels: 0.4,
+          }),
+          new GeoJsonLayer({
+            id: "region-stair-chunks",
+            data: {
+              type: "FeatureCollection",
+              features: stairChunks.map(({ region, stair }) => ({
+                type: "Feature",
+                properties: {
+                  kind: "stair",
+                  regionId: region.id,
+                  layer: selectedMobileLayer,
+                },
+                geometry: {
+                  type: "Polygon",
+                  coordinates: [ring(chunkAreaCorners(stairChunkArea(stair)))],
+                },
+              })),
+            },
+            visible: showRegionRoads,
+            pickable: false,
+            filled: true,
+            stroked: true,
+            getFillColor: [52, 41, 27, 235],
+            getLineColor: [246, 203, 111, 255],
+            getLineWidth: 1,
+            lineWidthUnits: "pixels",
+            lineWidthMinPixels: 0.8,
+          }),
+          new GeoJsonLayer({
+            id: "region-stair-patterns",
+            data: {
+              type: "FeatureCollection",
+              features: stairChunks.map(({ region, stair }) => ({
+                type: "Feature",
+                properties: {
+                  kind: "stair-pattern",
+                  regionId: region.id,
+                  layer: selectedMobileLayer,
+                },
+                geometry: {
+                  type: "LineString",
+                  coordinates: stairPattern(stair),
+                },
+              })),
+            },
+            visible: showRegionRoads,
+            pickable: false,
+            filled: false,
+            stroked: true,
+            getLineColor: [255, 224, 154, 255],
+            getLineWidth: 1.4,
+            lineWidthUnits: "pixels",
+            lineWidthMinPixels: 1,
           }),
         ]
       : []),
@@ -897,8 +1450,6 @@ const Header = memo(function Header({
   setShowTerrainLabels,
   terrainColorized,
   setTerrainColorized,
-  detailPanelOpen,
-  toggleDetailPanel,
 }) {
   const cities = layout.nations.reduce(
     (sum, nation) => sum + nation.cities.length,
@@ -927,19 +1478,27 @@ const Header = memo(function Header({
           >
             三维地形
           </button>
+          <button
+            className={viewMode === "side" ? "active" : ""}
+            onClick={() => switchView("side")}
+          >
+            四层侧视
+          </button>
         </div>
-        <label className="header-label-toggle">
-          <input
-            type="checkbox"
-            checked={viewMode === "map" ? showMapLabels : showTerrainLabels}
-            onChange={(event) =>
-              viewMode === "map"
-                ? setShowMapLabels(event.target.checked)
-                : setShowTerrainLabels(event.target.checked)
-            }
-          />
-          <span>{viewMode === "map" ? "显示文字" : "显示国家名称"}</span>
-        </label>
+        {viewMode !== "side" && (
+          <label className="header-label-toggle">
+            <input
+              type="checkbox"
+              checked={viewMode === "map" ? showMapLabels : showTerrainLabels}
+              onChange={(event) =>
+                viewMode === "map"
+                  ? setShowMapLabels(event.target.checked)
+                  : setShowTerrainLabels(event.target.checked)
+              }
+            />
+            <span>{viewMode === "map" ? "显示文字" : "显示国家名称"}</span>
+          </label>
+        )}
         {viewMode === "terrain" && (
           <label className="header-label-toggle">
             <input
@@ -949,14 +1508,6 @@ const Header = memo(function Header({
             />
             <span>分层设色</span>
           </label>
-        )}
-        {viewMode === "map" && (
-          <button
-            className={`nation-detail-trigger ${detailPanelOpen ? "active" : ""}`}
-            onClick={toggleDetailPanel}
-          >
-            国家详情
-          </button>
         )}
       </div>
       <div className="world-meta">
@@ -974,56 +1525,41 @@ const Header = memo(function Header({
   );
 });
 
-const NationDetailPanel = memo(function NationDetailPanel({
-  layout,
-  selectedNationId,
-  onSelect,
-  onExit,
-  onClose,
-  detailState,
+const BuildingLegend = memo(function BuildingLegend({
+  buildingTypes,
+  selectedMobileLayer,
+  showAllLayers = false,
 }) {
-  const selectedNation = layout.nations.find(
-    (nation) => nation.id === selectedNationId,
-  );
+  const layer = MOBILE_LAYERS.find((item) => item.id === selectedMobileLayer);
+  const lowerLayerBuildings = MOBILE_LAYERS.filter(
+    (item) => item.id !== "surface",
+  ).map((item) => ({
+    id: `mobile_plot_${item.id}_layer`,
+    zh_cn_name: `${item.label}层建筑`,
+  }));
+  const entries = showAllLayers
+    ? [...lowerLayerBuildings, ...buildingTypes]
+    : selectedMobileLayer === "surface"
+      ? buildingTypes
+      : lowerLayerBuildings.filter(
+          (building) => building.id === `mobile_plot_${selectedMobileLayer}_layer`,
+        );
   return (
-    <aside className="nation-detail-panel panel">
-      <div className="nation-detail-heading">
-        <div>
-          <span className="eyebrow">NATION DETAIL</span>
-          <h2>{selectedNation?.zh_cn_name ?? "选择国家"}</h2>
-        </div>
-        <button className="icon-button" title="关闭" onClick={onClose}>×</button>
+    <aside className="building-icon-legend panel" aria-label="建筑颜色图例">
+      <div className="building-legend-heading">
+        <span>建筑颜色</span>
+        <small>{showAllLayers ? "四层" : `${layer.label}层`}</small>
       </div>
-      {selectedNation && (
-        <div className="nation-detail-status">
-          <span>{selectedNation.cities.length} 个城市</span>
-          <span>
-            {selectedNation.cities.reduce(
-              (total, city) => total + city.regions.length,
-              0,
-            )}{" "}
-            个 Region
-          </span>
-          {detailState.loading && <b>正在加载道路与建筑…</b>}
-          {detailState.data && <b>道路与建筑已加载</b>}
-          {detailState.error && <b className="error-text">加载失败</b>}
-          <button onClick={onExit}>退出详情</button>
-        </div>
-      )}
-      <div className="nation-detail-list">
-        {layout.nations.map((nation, index) => (
-          <button
-            key={nation.id}
-            className={nation.id === selectedNationId ? "active" : ""}
-            onClick={() => onSelect(nation)}
-          >
-            <i style={{ background: `rgb(${COLORS[index % COLORS.length].join(" ")})` }} />
-            <span>
-              <strong>{nation.zh_cn_name}</strong>
-              <small>{nation.id}</small>
-            </span>
-            <em>{nation.cities.length}</em>
-          </button>
+      <div className="building-legend-list">
+        {entries.map((building) => (
+          <div key={building.id} title={building.en_us_name ?? building.id}>
+            <i
+              style={{
+                background: `rgb(${buildingColor(building.id).join(" ")})`,
+              }}
+            />
+            <span>{building.zh_cn_name}</span>
+          </div>
         ))}
       </div>
     </aside>
@@ -1174,9 +1710,17 @@ export default function App() {
   const [terrainColorized, setTerrainColorized] = useState(false);
   const [formationProgress, setFormationProgress] = useState(null);
   const [formationPlaying, setFormationPlaying] = useState(false);
-  const [detailPanelOpen, setDetailPanelOpen] = useState(false);
-  const [selectedNationId, setSelectedNationId] = useState(null);
+  const [selectedMobileLayer, setSelectedMobileLayer] = useState("surface");
+  const [layerMenuOpen, setLayerMenuOpen] = useState(false);
+  const [activeMapNationId, setActiveMapNationId] = useState(null);
+  const [sideFocusTarget, setSideFocusTarget] = useState(HOME.target);
+  const [splitSideRegion, setSplitSideRegion] = useState(null);
   const [nationDetailState, setNationDetailState] = useState({
+    data: null,
+    loading: false,
+    error: null,
+  });
+  const [splitNationDetailState, setSplitNationDetailState] = useState({
     data: null,
     loading: false,
     error: null,
@@ -1190,6 +1734,7 @@ export default function App() {
   const coordinateFrame = useRef(0);
   const formationFrame = useRef(0);
   const hoveredKey = useRef("");
+  const activeMapNationIdRef = useRef(null);
 
   const pauseFormation = useCallback(() => {
     if (formationFrame.current) cancelAnimationFrame(formationFrame.current);
@@ -1200,35 +1745,63 @@ export default function App() {
     pauseFormation();
     setFormationProgress(null);
   }, [pauseFormation]);
+  const updateActiveMapNation = useCallback(
+    (target) => {
+      const nationId = target ? nationAtTarget(layout, target) : null;
+      if (nationId === activeMapNationIdRef.current) return;
+      activeMapNationIdRef.current = nationId;
+      setActiveMapNationId(nationId);
+    },
+    [layout],
+  );
 
-  const setMapView = useCallback((target, zoom) => {
-    const next = {
-      ...liveView.current,
-      target: [target[0], target[1], target[2] ?? 0],
-      zoom,
-      minZoom: HOME.minZoom,
-      maxZoom: HOME.maxZoom,
-    };
-    liveView.current = next;
-    if (liveViewMode.current === "map") {
-      const nextMode = getLabelMode(zoom);
-      if (nextMode !== liveLabelMode.current) {
-        liveLabelMode.current = nextMode;
-        setLabelMode(nextMode);
+  const setMapView = useCallback(
+    (target, zoom) => {
+      const next = {
+        ...liveView.current,
+        target: [target[0], target[1], target[2] ?? 0],
+        zoom,
+        minZoom: HOME.minZoom,
+        maxZoom: HOME.maxZoom,
+      };
+      liveView.current = next;
+      if (liveViewMode.current === "map") {
+        updateActiveMapNation(next.target);
+        const nextMode = getLabelMode(zoom);
+        if (nextMode !== liveLabelMode.current) {
+          liveLabelMode.current = nextMode;
+          setLabelMode(nextMode);
+          hoveredKey.current = "";
+          setHovered(null);
+        }
       }
-    }
-    setInitialViewState(next);
-    if (coordinatesRef.current) {
-      coordinatesRef.current.textContent = `X ${number(next.target[0])} · Z ${number(-next.target[1])}`;
-    }
-  }, []);
+      setInitialViewState(next);
+      if (coordinatesRef.current) {
+        coordinatesRef.current.textContent = `X ${number(next.target[0])} · Z ${number(-next.target[1])}`;
+      }
+    },
+    [updateActiveMapNation],
+  );
   const switchView = useCallback((mode) => {
     if (mode === liveViewMode.current) return;
     stopFormation();
+    setLayerMenuOpen(false);
+    setSplitSideRegion(null);
+    const currentTarget = liveView.current.target ?? HOME.target;
+    if (mode === "side") setSideFocusTarget(currentTarget);
     liveViewMode.current = mode;
     setViewMode(mode);
-    const home = mode === "terrain" ? TERRAIN_HOME : HOME;
+    const home =
+      mode === "terrain"
+        ? TERRAIN_HOME
+        : mode === "side"
+          ? {
+              ...SIDE_HOME,
+              target: [currentTarget[0], currentTarget[1], SIDE_HOME.target[2]],
+            }
+          : HOME;
     liveView.current = home;
+    updateActiveMapNation(mode === "terrain" ? null : home.target);
     if (mode === "map") {
       const nextMode = getLabelMode(home.zoom);
       liveLabelMode.current = nextMode;
@@ -1239,7 +1812,7 @@ export default function App() {
     setInitialViewState({ ...home, target: [...home.target] });
     if (coordinatesRef.current)
       coordinatesRef.current.textContent = "X 0 · Z 0";
-  }, [stopFormation]);
+  }, [stopFormation, updateActiveMapNation]);
   const playFormation = useCallback(() => {
     pauseFormation();
     if (liveViewMode.current !== "map") switchView("map");
@@ -1287,19 +1860,6 @@ export default function App() {
     },
     [formationProgress, pauseFormation, setMapView],
   );
-  const selectNation = useCallback(
-    (nation) => {
-      stopFormation();
-      setSelectedNationId(nation.id);
-      setMapView(xy(nation.center), -2.3);
-    },
-    [setMapView, stopFormation],
-  );
-  const exitNationDetail = useCallback(() => {
-    setSelectedNationId(null);
-    hoveredKey.current = "";
-    setHovered(null);
-  }, []);
   const hoverItem = useCallback((item) => {
     const key = item
       ? `${item.kind}:${item.regionKey ?? item.id}`
@@ -1307,6 +1867,19 @@ export default function App() {
     if (key === hoveredKey.current) return;
     hoveredKey.current = key;
     setHovered(item ?? null);
+  }, []);
+  const openRegionSide = useCallback((region) => {
+    const target = xy(region.center);
+    activeMapNationIdRef.current = region.nationId;
+    setActiveMapNationId(region.nationId);
+    setSideFocusTarget(target);
+    setLayerMenuOpen(false);
+    setSplitSideRegion({
+      key: region.regionKey,
+      nationId: region.nationId,
+      name: region.zh_cn_name,
+      cityName: region.cityName,
+    });
   }, []);
   const changeView = useCallback(({ viewState: next }) => {
     liveView.current = {
@@ -1316,6 +1889,7 @@ export default function App() {
     };
     const zoom = Array.isArray(next.zoom) ? next.zoom[0] : next.zoom;
     if (liveViewMode.current === "map") {
+      updateActiveMapNation(next.target ?? HOME.target);
       const nextMode = getLabelMode(zoom);
       if (nextMode !== liveLabelMode.current) {
         liveLabelMode.current = nextMode;
@@ -1332,7 +1906,7 @@ export default function App() {
         coordinatesRef.current.textContent = `X ${number(target[0])} · Z ${number(-target[1])}`;
       }
     });
-  }, []);
+  }, [updateActiveMapNation]);
   useEffect(
     () => () => {
       if (coordinateFrame.current)
@@ -1343,48 +1917,25 @@ export default function App() {
     [],
   );
   useEffect(() => {
-    if (!layout || !selectedNationId) {
+    updateActiveMapNation(
+      liveViewMode.current === "terrain" ? null : liveView.current.target,
+    );
+  }, [layout, updateActiveMapNation]);
+  const detailNationId =
+    viewMode === "side" ||
+    (viewMode === "map" &&
+      (labelMode === "plot" || labelMode === "building"))
+      ? activeMapNationId
+      : null;
+  useEffect(() => {
+    if (!layout || !detailNationId) {
       setNationDetailState({ data: null, loading: false, error: null });
       return undefined;
     }
-    const detailPath = layout.nation_detail_files?.[selectedNationId];
-    if (!detailPath) {
-      setNationDetailState({
-        data: null,
-        loading: false,
-        error: new Error(`缺少国家详情文件: ${selectedNationId}`),
-      });
-      return undefined;
-    }
-
     const controller = new AbortController();
     setNationDetailState({ data: null, loading: true, error: null });
-    fetch(versionedAsset(`data/${detailPath}`), { signal: controller.signal })
-      .then((response) => {
-        if (!response.ok)
-          throw new Error(`${detailPath}: HTTP ${response.status}`);
-        return readPossiblyGzippedJson(response, detailPath);
-      })
-      .then((data) => {
-        if (
-          data.schema_version !== layout.schema_version ||
-          data.nation?.id !== selectedNationId
-        ) {
-          throw new Error(`国家详情数据不匹配: ${selectedNationId}`);
-        }
-        const nationDetail = {
-          schema_version: data.schema_version,
-          nation_id: data.nation.id,
-          regions: data.nation.cities.flatMap((city) =>
-            city.regions.map((region) => ({
-              id: region.id,
-              city_id: city.id,
-              slot_index: region.slot_index,
-              roads: region.region_layout.road_graph.edges,
-              building_slots: region.building_slots,
-            })),
-          ),
-        };
+    fetchNationDetail(layout, detailNationId, controller.signal)
+      .then((nationDetail) => {
         setNationDetailState({
           data: nationDetail,
           loading: false,
@@ -1396,9 +1947,51 @@ export default function App() {
           setNationDetailState({ data: null, loading: false, error });
       });
     return () => controller.abort();
-  }, [layout, selectedNationId]);
+  }, [detailNationId, layout]);
+
+  const splitNationId = splitSideRegion?.nationId ?? null;
+  useEffect(() => {
+    if (!layout || !splitNationId) {
+      setSplitNationDetailState({ data: null, loading: false, error: null });
+      return undefined;
+    }
+    if (nationDetailState.data?.nation_id === splitNationId) {
+      setSplitNationDetailState({
+        data: nationDetailState.data,
+        loading: false,
+        error: null,
+      });
+      return undefined;
+    }
+    if (splitNationDetailState.data?.nation_id === splitNationId)
+      return undefined;
+    const controller = new AbortController();
+    setSplitNationDetailState({ data: null, loading: true, error: null });
+    fetchNationDetail(layout, splitNationId, controller.signal)
+      .then((nationDetail) =>
+        setSplitNationDetailState({
+          data: nationDetail,
+          loading: false,
+          error: null,
+        }),
+      )
+      .catch((error) => {
+        if (error.name !== "AbortError")
+          setSplitNationDetailState({ data: null, loading: false, error });
+      });
+    return () => controller.abort();
+  }, [layout, nationDetailState.data, splitNationDetailState.data, splitNationId]);
 
   const visibleNations = layout?.nations ?? [];
+  const activeNationDetail =
+    nationDetailState.data?.nation_id === detailNationId
+      ? nationDetailState.data
+      : null;
+  const sideNationDetail = splitNationId
+    ? [nationDetailState.data, splitNationDetailState.data].find(
+        (detail) => detail?.nation_id === splitNationId,
+      ) ?? null
+    : activeNationDetail;
   const layers = useMemo(
     () =>
       layout
@@ -1407,11 +2000,12 @@ export default function App() {
             visibleNations,
             hovered,
             hoverItem,
+            openRegionSide,
             labelMode,
             showMapLabels,
             formationProgress,
-            nationDetailState.data,
-            selectedNationId,
+            activeNationDetail,
+            selectedMobileLayer,
           )
         : [],
     [
@@ -1419,11 +2013,12 @@ export default function App() {
       visibleNations,
       hovered,
       hoverItem,
+      openRegionSide,
       labelMode,
       showMapLabels,
       formationProgress,
-      nationDetailState.data,
-      selectedNationId,
+      activeNationDetail,
+      selectedMobileLayer,
     ],
   );
   const terrainMetrics = useMemo(
@@ -1439,7 +2034,7 @@ export default function App() {
     const boundaryData = createTerrainBoundaries(layout);
     const structures = createTerrainStructures(
       layout,
-      nationDetailState.data,
+      null,
       terrainMetrics,
       heightmap,
     );
@@ -1548,12 +2143,47 @@ export default function App() {
   }, [
     heightmap,
     layout,
-    nationDetailState.data,
     showTerrainLabels,
     terrainColorized,
     terrainMetrics,
     viewMode,
   ]);
+  const sideLayers = useMemo(() => {
+    if (viewMode !== "side" && !splitSideRegion) return [];
+    const structures = createSideStructures(sideNationDetail, sideFocusTarget);
+    return [
+      new SimpleMeshLayer({
+        id: "side-layer-blocks",
+        data: structures.blocks,
+        mesh: UNIT_BOX_MESH,
+        getPosition: (item) => item.position,
+        getScale: (item) => item.scale,
+        getColor: (item) => item.color,
+        material: false,
+        pickable: false,
+      }),
+      new SimpleMeshLayer({
+        id: "side-layer-roads",
+        data: structures.roads,
+        mesh: UNIT_BOX_MESH,
+        getPosition: (item) => item.position,
+        getScale: (item) => item.scale,
+        getColor: (item) => item.color,
+        material: false,
+        pickable: false,
+      }),
+      new SimpleMeshLayer({
+        id: "side-layer-stairs",
+        data: structures.stairs,
+        mesh: UNIT_BOX_MESH,
+        getPosition: (item) => item.position,
+        getScale: (item) => item.scale,
+        getColor: (item) => item.color,
+        material: false,
+        pickable: false,
+      }),
+    ];
+  }, [sideFocusTarget, sideNationDetail, splitSideRegion, viewMode]);
   const zoomBy = (delta) => {
     const current = liveView.current;
     const zoom = Array.isArray(current.zoom) ? current.zoom[0] : current.zoom;
@@ -1563,8 +2193,23 @@ export default function App() {
     );
   };
   const resetView = () => {
-    const home = viewMode === "terrain" ? TERRAIN_HOME : HOME;
+    const activeNation = layout.nations.find(
+      (nation) => nation.id === activeMapNationId,
+    );
+    const home =
+      viewMode === "terrain"
+        ? TERRAIN_HOME
+        : viewMode === "side"
+          ? {
+              ...SIDE_HOME,
+              target: activeNation
+                ? [activeNation.center.x, -activeNation.center.z, SIDE_HOME.target[2]]
+                : SIDE_HOME.target,
+            }
+          : HOME;
     liveView.current = home;
+    if (viewMode === "side") setSideFocusTarget(home.target);
+    updateActiveMapNation(viewMode === "terrain" ? null : home.target);
     setInitialViewState({ ...home, target: [...home.target] });
     if (coordinatesRef.current)
       coordinatesRef.current.textContent = "X 0 · Z 0";
@@ -1586,24 +2231,76 @@ export default function App() {
       </div>
     );
   return (
-    <div id="app" className={detailPanelOpen ? "detail-open" : ""}>
+    <div id="app" className={splitSideRegion ? "split-side-open" : ""}>
       <div
         id="map"
-        aria-label={viewMode === "terrain" ? "Terra 三维地形" : "Terra 二维地图"}
+        aria-label={
+          viewMode === "terrain"
+            ? "Terra 三维地形"
+            : viewMode === "side"
+              ? "Terra 四层侧视图"
+              : "Terra 二维地图"
+        }
+        onClick={() => setLayerMenuOpen(false)}
+        onPointerLeave={() => hoverItem(null)}
         onContextMenu={
-          viewMode === "terrain" ? (event) => event.preventDefault() : undefined
+          viewMode !== "map" ? (event) => event.preventDefault() : undefined
         }
       >
         <DeckGL
-          views={viewMode === "terrain" ? ORBIT_VIEW : ORTHO_VIEW}
+          views={viewMode === "map" ? ORTHO_VIEW : ORBIT_VIEW}
           initialViewState={initialViewState}
           onViewStateChange={changeView}
-          controller={viewMode === "terrain" ? true : CONTROLLER}
-          layers={viewMode === "terrain" ? terrainLayers : layers}
+          controller={viewMode === "map" ? CONTROLLER : true}
+          layers={
+            viewMode === "terrain"
+              ? terrainLayers
+              : viewMode === "side"
+                ? sideLayers
+                : layers
+          }
           useDevicePixels={DEVICE_PIXEL_RATIO}
           getCursor={GET_CURSOR}
         />
       </div>
+      {viewMode === "map" && splitSideRegion && (
+        <section className="split-side-view" aria-label="Region 四层侧视图">
+          <div className="split-side-heading">
+            <span>
+              <small>{splitSideRegion.cityName}</small>
+              <strong>{splitSideRegion.name}</strong>
+            </span>
+            <button
+              title="关闭侧视图"
+              aria-label="关闭侧视图"
+              onClick={() => setSplitSideRegion(null)}
+            >
+              ×
+            </button>
+          </div>
+          <div
+            className="split-side-canvas"
+            onContextMenu={(event) => event.preventDefault()}
+          >
+            <DeckGL
+              key={splitSideRegion.key}
+              views={ORBIT_VIEW}
+              initialViewState={{
+                ...SIDE_HOME,
+                target: [
+                  sideFocusTarget[0],
+                  sideFocusTarget[1],
+                  SIDE_HOME.target[2],
+                ],
+              }}
+              controller
+              layers={sideLayers}
+              useDevicePixels={DEVICE_PIXEL_RATIO}
+              getCursor={GET_CURSOR}
+            />
+          </div>
+        </section>
+      )}
       <Header
         layout={layout}
         viewMode={viewMode}
@@ -1614,19 +2311,7 @@ export default function App() {
         setShowTerrainLabels={setShowTerrainLabels}
         terrainColorized={terrainColorized}
         setTerrainColorized={setTerrainColorized}
-        detailPanelOpen={detailPanelOpen}
-        toggleDetailPanel={() => setDetailPanelOpen((open) => !open)}
       />
-      {viewMode === "map" && detailPanelOpen && (
-        <NationDetailPanel
-          layout={layout}
-          selectedNationId={selectedNationId}
-          onSelect={selectNation}
-          onExit={exitNationDetail}
-          onClose={() => setDetailPanelOpen(false)}
-          detailState={nationDetailState}
-        />
-      )}
       {viewMode === "map" && (
         <div className="map-options">
           <div className="map-option-controls">
@@ -1670,6 +2355,21 @@ export default function App() {
           </div>
         </div>
       )}
+      {viewMode === "map" &&
+        (labelMode === "building" || splitSideRegion) && (
+        <BuildingLegend
+          buildingTypes={layout.building_types}
+          selectedMobileLayer={selectedMobileLayer}
+          showAllLayers={Boolean(splitSideRegion)}
+        />
+      )}
+      {viewMode === "side" && (
+        <BuildingLegend
+          buildingTypes={layout.building_types}
+          selectedMobileLayer="surface"
+          showAllLayers
+        />
+      )}
       <div className="map-tools">
         <button title="放大" onClick={() => zoomBy(0.6)}>
           +
@@ -1677,6 +2377,43 @@ export default function App() {
         <button title="缩小" onClick={() => zoomBy(-0.6)}>
           −
         </button>
+        {viewMode === "map" && (
+          <div className="map-layer-control">
+            <button
+              className={`map-layer-trigger ${layerMenuOpen ? "active" : ""}`}
+              title="选择预览层"
+              aria-label="选择预览层"
+              aria-expanded={layerMenuOpen}
+              onClick={() => setLayerMenuOpen((open) => !open)}
+            >
+              <span className="layers-icon" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+              </span>
+            </button>
+            {layerMenuOpen && (
+              <div className="map-layer-menu" role="menu">
+                <small>预览层</small>
+                {MOBILE_LAYERS.map((layer) => (
+                  <button
+                    key={layer.id}
+                    role="menuitemradio"
+                    aria-checked={selectedMobileLayer === layer.id}
+                    className={selectedMobileLayer === layer.id ? "active" : ""}
+                    onClick={() => {
+                      setSelectedMobileLayer(layer.id);
+                      setLayerMenuOpen(false);
+                    }}
+                  >
+                    <span>{layer.label}</span>
+                    <em>{layer.id}</em>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <button
           title="显示完整地图"
           onClick={resetView}
@@ -1719,7 +2456,9 @@ export default function App() {
         <span className="status-help">
           {viewMode === "terrain"
             ? `拖拽旋转 · 右键平移 · 滚轮缩放 · 高程夸张 ${terrainMetrics?.scale.toFixed(1)}×`
-            : "拖拽移动 · 滚轮缩放 · 悬停高亮"}
+            : viewMode === "side"
+              ? "拖拽旋转 · 右键平移 · 滚轮缩放 · 四层同时显示"
+              : "拖拽移动 · 滚轮缩放 · 悬停高亮"}
         </span>
       </footer>
     </div>
