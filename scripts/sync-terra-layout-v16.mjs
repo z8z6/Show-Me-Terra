@@ -13,7 +13,8 @@ const sourceDirectory = path.resolve(sourceValue);
 const targetDirectory = path.resolve(targetValue);
 const sourceIndexPath = path.join(sourceDirectory, "index.json.gz");
 const sourceNationDirectory = path.join(sourceDirectory, "nations");
-const targetNationDirectory = path.join(targetDirectory, "terra-nations");
+const targetCityDirectory = path.join(targetDirectory, "terra-cities");
+const legacyTargetNationDirectory = path.join(targetDirectory, "terra-nations");
 
 if (!fs.existsSync(sourceIndexPath) || !fs.existsSync(sourceNationDirectory)) {
   throw new Error(`找不到 Terra Layout v16 拆分资源: ${sourceDirectory}`);
@@ -36,10 +37,10 @@ for (const item of nationFiles) {
     throw new Error(`缺少国家数据: ${item.nationId}`);
 }
 
-fs.rmSync(targetNationDirectory, { recursive: true, force: true });
-fs.mkdirSync(targetNationDirectory, { recursive: true });
+fs.rmSync(targetCityDirectory, { recursive: true, force: true });
+fs.mkdirSync(targetCityDirectory, { recursive: true });
 
-const nationDetailFiles = {};
+const cityDetailFiles = {};
 const nations = nationFiles.map(({ nationId, sourcePath }) => {
   const detail = readGzipJson(sourcePath);
   if (detail.schema_version !== 16 || detail.nation?.id !== nationId) {
@@ -80,9 +81,23 @@ const nations = nationFiles.map(({ nationId, sourcePath }) => {
     }
   }
 
-  const filename = `${nationId}.json.gz`;
-  fs.copyFileSync(sourcePath, path.join(targetNationDirectory, filename));
-  nationDetailFiles[nationId] = `terra-nations/${filename}`;
+  const nationCityDirectory = path.join(targetCityDirectory, nationId);
+  fs.mkdirSync(nationCityDirectory, { recursive: true });
+  cityDetailFiles[nationId] = {};
+  for (const city of detail.nation.cities) {
+    const filename = `${city.id}.json.gz`;
+    const payload = {
+      schema_version: detail.schema_version,
+      nation_id: nationId,
+      city,
+    };
+    fs.writeFileSync(
+      path.join(nationCityDirectory, filename),
+      zlib.gzipSync(JSON.stringify(payload), { level: 9 }),
+    );
+    cityDetailFiles[nationId][city.id] =
+      `terra-cities/${nationId}/${filename}`;
+  }
 
   return {
     ...detail.nation,
@@ -97,21 +112,23 @@ const nations = nationFiles.map(({ nationId, sourcePath }) => {
 
 const overview = {
   ...index,
-  nation_detail_files: nationDetailFiles,
+  city_detail_files: cityDetailFiles,
   nations,
 };
 const overviewPath = path.join(targetDirectory, "terra_layout.json");
 fs.mkdirSync(targetDirectory, { recursive: true });
 fs.writeFileSync(overviewPath, JSON.stringify(overview));
+fs.rmSync(legacyTargetNationDirectory, { recursive: true, force: true });
 
 const detailBytes = fs
-  .readdirSync(targetNationDirectory)
-  .reduce(
-    (total, filename) =>
-      total + fs.statSync(path.join(targetNationDirectory, filename)).size,
-    0,
-  );
+  .readdirSync(targetCityDirectory, { recursive: true, withFileTypes: true })
+  .filter((entry) => entry.isFile())
+  .reduce((total, entry) => total + fs.statSync(path.join(entry.parentPath, entry.name)).size, 0);
+const cityCount = Object.values(cityDetailFiles).reduce(
+  (total, files) => total + Object.keys(files).length,
+  0,
+);
 console.log(
   `Terra Layout v16 synced: overview ${(fs.statSync(overviewPath).size / 1048576).toFixed(1)} MiB, ` +
-    `${nations.length} gzip nation files ${(detailBytes / 1048576).toFixed(1)} MiB`,
+    `${cityCount} gzip city files ${(detailBytes / 1048576).toFixed(1)} MiB`,
 );

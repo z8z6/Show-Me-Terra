@@ -47,6 +47,7 @@ const terrainPaletteColor = (height, min, max) => {
 };
 const versionedAsset = (path) =>
   `${import.meta.env.BASE_URL}${path}?v=${encodeURIComponent(__BUILD_ID__)}`;
+const CITY_DETAIL_CACHE = new Map();
 async function readPossiblyGzippedJson(response, path) {
   const buffer = await response.arrayBuffer();
   const bytes = new Uint8Array(buffer);
@@ -54,44 +55,48 @@ async function readPossiblyGzippedJson(response, path) {
     return JSON.parse(new TextDecoder().decode(bytes));
   }
   if (typeof DecompressionStream === "undefined") {
-    throw new Error(`浏览器不支持解压国家详情: ${path}`);
+    throw new Error(`浏览器不支持解压城市详情: ${path}`);
   }
   const stream = new Blob([buffer])
     .stream()
     .pipeThrough(new DecompressionStream("gzip"));
   return new Response(stream).json();
 }
-const normalizeNationDetail = (data) => ({
+const normalizeCityDetail = (data) => ({
   schema_version: data.schema_version,
-  nation_id: data.nation.id,
-  regions: data.nation.cities.flatMap((city) =>
-    city.regions.map((region) => {
-      const mobileLayers = region.region_layout.mobile_layers;
-      const surface = mobileLayers.find((layer) => layer.layer === "surface");
-      if (!surface) throw new Error(`Region 缺少 surface 层: ${region.id}`);
-      return {
-        id: region.id,
-        city_id: city.id,
-        slot_index: region.slot_index,
-        mobile_layers: mobileLayers,
-        roads: surface.road_graph.edges,
-        building_slots: region.building_slots,
-      };
-    }),
-  ),
+  nation_id: data.nation_id,
+  city_id: data.city.id,
+  regions: data.city.regions.map((region) => {
+    const mobileLayers = region.region_layout.mobile_layers;
+    const surface = mobileLayers.find((layer) => layer.layer === "surface");
+    if (!surface) throw new Error(`Region 缺少 surface 层: ${region.id}`);
+    return {
+      id: region.id,
+      city_id: data.city.id,
+      slot_index: region.slot_index,
+      mobile_layers: mobileLayers,
+      roads: surface.road_graph.edges,
+      building_slots: region.building_slots,
+    };
+  }),
 });
-async function fetchNationDetail(layout, nationId, signal) {
-  const detailPath = layout.nation_detail_files?.[nationId];
-  if (!detailPath) throw new Error(`缺少国家详情文件: ${nationId}`);
+async function fetchCityDetail(layout, nationId, cityId, signal) {
+  const detailPath = layout.city_detail_files?.[nationId]?.[cityId];
+  if (!detailPath) throw new Error(`缺少城市详情文件: ${nationId}/${cityId}`);
+  const cached = CITY_DETAIL_CACHE.get(detailPath);
+  if (cached) return cached;
   const response = await fetch(versionedAsset(`data/${detailPath}`), { signal });
   if (!response.ok) throw new Error(`${detailPath}: HTTP ${response.status}`);
   const data = await readPossiblyGzippedJson(response, detailPath);
   if (
     data.schema_version !== layout.schema_version ||
-    data.nation?.id !== nationId
+    data.nation_id !== nationId ||
+    data.city?.id !== cityId
   )
-    throw new Error(`国家详情数据不匹配: ${nationId}`);
-  return normalizeNationDetail(data);
+    throw new Error(`城市详情数据不匹配: ${nationId}/${cityId}`);
+  const detail = normalizeCityDetail(data);
+  CITY_DETAIL_CACHE.set(detailPath, detail);
+  return detail;
 }
 const HOME = { target: [0, 0, 0], zoom: -6.35, minZoom: -8, maxZoom: 2 };
 const TERRAIN_HOME = {
@@ -403,9 +408,15 @@ const pointInBoundary = (target, boundary) => {
   }
   return inside;
 };
-const nationAtTarget = (layout, target) =>
-  layout?.nations.find((nation) => pointInBoundary(target, nation.boundary))
-    ?.id ?? null;
+const locationAtTarget = (layout, target) => {
+  const nation = layout?.nations.find((item) =>
+    pointInBoundary(target, item.boundary),
+  );
+  const city = nation?.cities.find((item) =>
+    pointInBoundary(target, item.boundary),
+  );
+  return { nationId: nation?.id ?? null, cityId: city?.id ?? null };
+};
 const buildingColor = (id) => {
   let hash = 0;
   for (let index = 0; index < id.length; index++)
@@ -1713,14 +1724,15 @@ export default function App() {
   const [selectedMobileLayer, setSelectedMobileLayer] = useState("surface");
   const [layerMenuOpen, setLayerMenuOpen] = useState(false);
   const [activeMapNationId, setActiveMapNationId] = useState(null);
+  const [activeMapCityId, setActiveMapCityId] = useState(null);
   const [sideFocusTarget, setSideFocusTarget] = useState(HOME.target);
   const [splitSideRegion, setSplitSideRegion] = useState(null);
-  const [nationDetailState, setNationDetailState] = useState({
+  const [cityDetailState, setCityDetailState] = useState({
     data: null,
     loading: false,
     error: null,
   });
-  const [splitNationDetailState, setSplitNationDetailState] = useState({
+  const [splitCityDetailState, setSplitCityDetailState] = useState({
     data: null,
     loading: false,
     error: null,
@@ -1735,6 +1747,7 @@ export default function App() {
   const formationFrame = useRef(0);
   const hoveredKey = useRef("");
   const activeMapNationIdRef = useRef(null);
+  const activeMapCityIdRef = useRef(null);
 
   const pauseFormation = useCallback(() => {
     if (formationFrame.current) cancelAnimationFrame(formationFrame.current);
@@ -1745,12 +1758,20 @@ export default function App() {
     pauseFormation();
     setFormationProgress(null);
   }, [pauseFormation]);
-  const updateActiveMapNation = useCallback(
+  const updateActiveMapLocation = useCallback(
     (target) => {
-      const nationId = target ? nationAtTarget(layout, target) : null;
-      if (nationId === activeMapNationIdRef.current) return;
+      const { nationId, cityId } = target
+        ? locationAtTarget(layout, target)
+        : { nationId: null, cityId: null };
+      if (
+        nationId === activeMapNationIdRef.current &&
+        cityId === activeMapCityIdRef.current
+      )
+        return;
       activeMapNationIdRef.current = nationId;
+      activeMapCityIdRef.current = cityId;
       setActiveMapNationId(nationId);
+      setActiveMapCityId(cityId);
     },
     [layout],
   );
@@ -1766,7 +1787,7 @@ export default function App() {
       };
       liveView.current = next;
       if (liveViewMode.current === "map") {
-        updateActiveMapNation(next.target);
+        updateActiveMapLocation(next.target);
         const nextMode = getLabelMode(zoom);
         if (nextMode !== liveLabelMode.current) {
           liveLabelMode.current = nextMode;
@@ -1780,7 +1801,7 @@ export default function App() {
         coordinatesRef.current.textContent = `X ${number(next.target[0])} · Z ${number(-next.target[1])}`;
       }
     },
-    [updateActiveMapNation],
+    [updateActiveMapLocation],
   );
   const switchView = useCallback((mode) => {
     if (mode === liveViewMode.current) return;
@@ -1801,7 +1822,7 @@ export default function App() {
             }
           : HOME;
     liveView.current = home;
-    updateActiveMapNation(mode === "terrain" ? null : home.target);
+    updateActiveMapLocation(mode === "terrain" ? null : home.target);
     if (mode === "map") {
       const nextMode = getLabelMode(home.zoom);
       liveLabelMode.current = nextMode;
@@ -1812,7 +1833,7 @@ export default function App() {
     setInitialViewState({ ...home, target: [...home.target] });
     if (coordinatesRef.current)
       coordinatesRef.current.textContent = "X 0 · Z 0";
-  }, [stopFormation, updateActiveMapNation]);
+  }, [stopFormation, updateActiveMapLocation]);
   const playFormation = useCallback(() => {
     pauseFormation();
     if (liveViewMode.current !== "map") switchView("map");
@@ -1871,12 +1892,15 @@ export default function App() {
   const openRegionSide = useCallback((region) => {
     const target = xy(region.center);
     activeMapNationIdRef.current = region.nationId;
+    activeMapCityIdRef.current = region.cityId;
     setActiveMapNationId(region.nationId);
+    setActiveMapCityId(region.cityId);
     setSideFocusTarget(target);
     setLayerMenuOpen(false);
     setSplitSideRegion({
       key: region.regionKey,
       nationId: region.nationId,
+      cityId: region.cityId,
       name: region.zh_cn_name,
       cityName: region.cityName,
     });
@@ -1889,7 +1913,7 @@ export default function App() {
     };
     const zoom = Array.isArray(next.zoom) ? next.zoom[0] : next.zoom;
     if (liveViewMode.current === "map") {
-      updateActiveMapNation(next.target ?? HOME.target);
+      updateActiveMapLocation(next.target ?? HOME.target);
       const nextMode = getLabelMode(zoom);
       if (nextMode !== liveLabelMode.current) {
         liveLabelMode.current = nextMode;
@@ -1906,7 +1930,7 @@ export default function App() {
         coordinatesRef.current.textContent = `X ${number(target[0])} · Z ${number(-target[1])}`;
       }
     });
-  }, [updateActiveMapNation]);
+  }, [updateActiveMapLocation]);
   useEffect(
     () => () => {
       if (coordinateFrame.current)
@@ -1917,79 +1941,100 @@ export default function App() {
     [],
   );
   useEffect(() => {
-    updateActiveMapNation(
+    updateActiveMapLocation(
       liveViewMode.current === "terrain" ? null : liveView.current.target,
     );
-  }, [layout, updateActiveMapNation]);
+  }, [layout, updateActiveMapLocation]);
   const detailNationId =
     viewMode === "side" ||
     (viewMode === "map" &&
       (labelMode === "plot" || labelMode === "building"))
       ? activeMapNationId
       : null;
+  const detailCityId = detailNationId ? activeMapCityId : null;
   useEffect(() => {
-    if (!layout || !detailNationId) {
-      setNationDetailState({ data: null, loading: false, error: null });
+    if (!layout || !detailNationId || !detailCityId) {
+      setCityDetailState({ data: null, loading: false, error: null });
       return undefined;
     }
     const controller = new AbortController();
-    setNationDetailState({ data: null, loading: true, error: null });
-    fetchNationDetail(layout, detailNationId, controller.signal)
-      .then((nationDetail) => {
-        setNationDetailState({
-          data: nationDetail,
+    setCityDetailState({ data: null, loading: true, error: null });
+    fetchCityDetail(layout, detailNationId, detailCityId, controller.signal)
+      .then((cityDetail) => {
+        setCityDetailState({
+          data: cityDetail,
           loading: false,
           error: null,
         });
       })
       .catch((error) => {
         if (error.name !== "AbortError")
-          setNationDetailState({ data: null, loading: false, error });
+          setCityDetailState({ data: null, loading: false, error });
       });
     return () => controller.abort();
-  }, [detailNationId, layout]);
+  }, [detailCityId, detailNationId, layout]);
 
   const splitNationId = splitSideRegion?.nationId ?? null;
+  const splitCityId = splitSideRegion?.cityId ?? null;
   useEffect(() => {
-    if (!layout || !splitNationId) {
-      setSplitNationDetailState({ data: null, loading: false, error: null });
+    if (!layout || !splitNationId || !splitCityId) {
+      setSplitCityDetailState({ data: null, loading: false, error: null });
       return undefined;
     }
-    if (nationDetailState.data?.nation_id === splitNationId) {
-      setSplitNationDetailState({
-        data: nationDetailState.data,
+    if (splitNationId === detailNationId && splitCityId === detailCityId)
+      return undefined;
+    if (
+      cityDetailState.data?.nation_id === splitNationId &&
+      cityDetailState.data?.city_id === splitCityId
+    ) {
+      setSplitCityDetailState({
+        data: cityDetailState.data,
         loading: false,
         error: null,
       });
       return undefined;
     }
-    if (splitNationDetailState.data?.nation_id === splitNationId)
+    if (
+      splitCityDetailState.data?.nation_id === splitNationId &&
+      splitCityDetailState.data?.city_id === splitCityId
+    )
       return undefined;
     const controller = new AbortController();
-    setSplitNationDetailState({ data: null, loading: true, error: null });
-    fetchNationDetail(layout, splitNationId, controller.signal)
-      .then((nationDetail) =>
-        setSplitNationDetailState({
-          data: nationDetail,
+    setSplitCityDetailState({ data: null, loading: true, error: null });
+    fetchCityDetail(layout, splitNationId, splitCityId, controller.signal)
+      .then((cityDetail) =>
+        setSplitCityDetailState({
+          data: cityDetail,
           loading: false,
           error: null,
         }),
       )
       .catch((error) => {
         if (error.name !== "AbortError")
-          setSplitNationDetailState({ data: null, loading: false, error });
+          setSplitCityDetailState({ data: null, loading: false, error });
       });
     return () => controller.abort();
-  }, [layout, nationDetailState.data, splitNationDetailState.data, splitNationId]);
+  }, [
+    cityDetailState.data,
+    layout,
+    splitCityDetailState.data,
+    splitCityId,
+    splitNationId,
+    detailCityId,
+    detailNationId,
+  ]);
 
   const visibleNations = layout?.nations ?? [];
   const activeNationDetail =
-    nationDetailState.data?.nation_id === detailNationId
-      ? nationDetailState.data
+    cityDetailState.data?.nation_id === detailNationId &&
+    cityDetailState.data?.city_id === detailCityId
+      ? cityDetailState.data
       : null;
   const sideNationDetail = splitNationId
-    ? [nationDetailState.data, splitNationDetailState.data].find(
-        (detail) => detail?.nation_id === splitNationId,
+    ? [cityDetailState.data, splitCityDetailState.data].find(
+        (detail) =>
+          detail?.nation_id === splitNationId &&
+          detail?.city_id === splitCityId,
       ) ?? null
     : activeNationDetail;
   const layers = useMemo(
@@ -2196,20 +2241,23 @@ export default function App() {
     const activeNation = layout.nations.find(
       (nation) => nation.id === activeMapNationId,
     );
+    const activeCity = activeNation?.cities.find(
+      (city) => city.id === activeMapCityId,
+    );
     const home =
       viewMode === "terrain"
         ? TERRAIN_HOME
         : viewMode === "side"
           ? {
               ...SIDE_HOME,
-              target: activeNation
-                ? [activeNation.center.x, -activeNation.center.z, SIDE_HOME.target[2]]
+              target: activeCity
+                ? [activeCity.center.x, -activeCity.center.z, SIDE_HOME.target[2]]
                 : SIDE_HOME.target,
             }
           : HOME;
     liveView.current = home;
     if (viewMode === "side") setSideFocusTarget(home.target);
-    updateActiveMapNation(viewMode === "terrain" ? null : home.target);
+    updateActiveMapLocation(viewMode === "terrain" ? null : home.target);
     setInitialViewState({ ...home, target: [...home.target] });
     if (coordinatesRef.current)
       coordinatesRef.current.textContent = "X 0 · Z 0";

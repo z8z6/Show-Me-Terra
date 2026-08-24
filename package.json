@@ -9,6 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "data:sync": "node scripts/sync-terra-layout-v16.mjs",
+    "data:cities": "node scripts/prepare-city-data.mjs",
     "terrain:generate": "node scripts/generate-terrain-assets.mjs"
   },
   "dependencies": {
